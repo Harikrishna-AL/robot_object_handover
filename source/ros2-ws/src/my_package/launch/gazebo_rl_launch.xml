@@ -1,0 +1,16 @@
+<launch>
+
+    <include file="$(find-pkg-share ur_simulation_gz)/launch/ur_sim_control.launch.py">
+        <arg name="start_joint_controller" value="true"/>
+        <arg name="initial_joint_controller" value="forward_position_controller"/>
+    </include>
+
+    <node name="rl_obs" pkg="my_package" exec="observation_node" output="screen"/>
+
+
+    <node name="rl_agent" pkg="my_package" exec="action_node" output="screen">
+        <param name="model_path" value="/home/docker_isaac_lab/IsaacLab/IsaacLab/source/logs/sb3/Isaac-UR5e-joint-reach-v0/2024-10-16_12-32-25/model_18960000_steps.zip"/>
+        <param name="cmd" value="1.0"/>
+    </node>
+
+</launch>
