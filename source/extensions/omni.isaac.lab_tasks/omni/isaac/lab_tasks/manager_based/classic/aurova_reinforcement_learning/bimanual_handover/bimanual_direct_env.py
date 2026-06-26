@@ -654,30 +654,47 @@ class BimanualDirect(DirectRLEnv):
         reward = reward + contacts_w[:, 1:-1].sum(-1) 
 
         # Reward for reaching target
-        reward = reward + self.cfg.bonus_obj_reach * self.obj_reached_target * (contacts_w[:, 1:].sum(-1) > 0.0).int()
+        bonus_term = self.cfg.bonus_obj_reach * self.obj_reached_target * (contacts_w[:, 1:].sum(-1) > 0.0).int()
+        reward = reward + bonus_term
 
-        # 1. Obtain linear velocity norm of the GEN3 end effector
+        # 1. Obtain linear velocity norm of the GEN3 end effector (useful for logging regardless of penalty)
         ee_vel_norm = torch.norm(self.scene.articulations[self.cfg.keys[self.cfg.GEN3]].data.body_state_w[:, self.ee_jacobi_idx[self.cfg.GEN3]+1, 7:10], dim=-1)
 
-        # 2. Define the safe velocity threshold (e.g., 0.05 m/s - set this in your cfg)
-        # v_min = self.cfg.v_min
-        v_min = 0.05
-
-        # 3. Calculate excess velocity using ReLU (equivalent to max(0, v - v_min))
-        excess_vel = torch.nn.functional.relu(ee_vel_norm - v_min)
-
-        # 4. Calculate the distance-conditioned penalty
-        lambda_vel = 35
-        k_decay = 13
-        velocity_penalty = lambda_vel * (excess_vel ** 2) * torch.exp(-k_decay * hand_obj_dist[:, 0])
-
-        # 5. Subtract from final reward
-        reward = reward - velocity_penalty
+        if self.cfg.vel_rew:
+            # 2. Define the safe velocity threshold
+            v_min = self.cfg.v_min
+    
+            # 3. Calculate excess velocity using ReLU
+            excess_vel = torch.nn.functional.relu(ee_vel_norm - v_min)
+    
+            # 4. Calculate the distance-conditioned penalty
+            lambda_vel = self.cfg.lambda_vel
+            k_decay = self.cfg.k_decay
+            velocity_penalty = lambda_vel * (excess_vel ** 2) * torch.exp(-k_decay * hand_obj_dist[:, 0])
+    
+            # 5. Subtract from final reward
+            reward = reward - velocity_penalty
 
 
         # Update previous distances
         self.prev_dist = hand_obj_dist[:, 0]
         self.prev_dist_target = obj_target_dist[:, 0]
+
+        # Log metrics to WandB
+        if "log" not in self.extras:
+            self.extras["log"] = dict()
+            
+        self.extras["log"]["reward_terms/approach"] = reward_1.mean().item()
+        self.extras["log"]["reward_terms/target"] = reward_2.mean().item()
+        self.extras["log"]["reward_terms/bonus"] = bonus_term.float().mean().item()
+        self.extras["log"]["metrics/hand_obj_dist"] = hand_obj_dist[:, 0].mean().item()
+        self.extras["log"]["metrics/obj_target_dist"] = obj_target_dist[:, 0].mean().item()
+        self.extras["log"]["metrics/gen3_ee_vel_norm"] = ee_vel_norm.mean().item()
+        self.extras["log"]["metrics/contact_forces"] = contacts_w.sum(-1).mean().item()
+        self.extras["log"]["metrics/success_rate"] = self.obj_reached_target.float().mean().item()
+        
+        if self.cfg.vel_rew:
+            self.extras["log"]["reward_terms/velocity_penalty"] = velocity_penalty.mean().item()
             
         return reward
     
@@ -713,6 +730,8 @@ class BimanualDirect(DirectRLEnv):
         truncated = torch.logical_or(torch.logical_or(falling, out_of_bounds), GEN3_ground_contact)
         terminated = torch.logical_or(time_out, self.obj_reached_target)
 
+        if "log" in self.extras:
+            self.extras["log"]["metrics/out_of_bounds"] = out_of_bounds.float().mean().item()
 
         return truncated, terminated
     
