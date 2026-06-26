@@ -54,9 +54,21 @@ from datetime import datetime
 from torch import nn
 
 from stable_baselines3 import PPO, SAC
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.vec_env import VecNormalize
+
+class Sb3CustomMetricsCallback(BaseCallback):
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if len(self.model.ep_info_buffer) > 0:
+            custom_keys = [k for k in self.model.ep_info_buffer[-1].keys() if k not in ["r", "l", "t"]]
+            for key in custom_keys:
+                values = [ep_info[key] for ep_info in self.model.ep_info_buffer if key in ep_info]
+                if len(values) > 0:
+                    self.logger.record(key, np.mean(values))
 
 from omni.isaac.lab.envs import (
     DirectMARLEnv,
@@ -167,7 +179,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     
     if args_cli.train:
         # train the agent
-        agent.learn(total_timesteps=n_timesteps, callback=[checkpoint_callback, WandbCallback()])
+        agent.learn(total_timesteps=n_timesteps, callback=[checkpoint_callback, Sb3CustomMetricsCallback(), WandbCallback()])
         # save the final model
         agent.save(os.path.join(log_dir, "model"))
 

@@ -286,8 +286,8 @@ class BimanualDirectCfg(DirectRLEnvCfg):
 
     # Velocity penalty variables
     vel_rew: bool = False
-    v_min: float = 0.05
-    lambda_vel: float = 35.0
+    v_min: float = 0.1
+    lambda_vel: float = 5.0
     k_decay: float = 13.0
 
 
