@@ -104,6 +104,9 @@ class BimanualDirect(DirectRLEnv):
 
         # Variable to store contacts between prims
         self.contacts = torch.empty(self.num_envs, self.num_contacts).fill_(False).to(self.device)
+        # NEW: Store force vectors [fx, fy, fz] per contact sensor
+        self.contact_forces = torch.zeros(self.num_envs, self.num_contacts, 3).to(self.device)
+        self.stability_timer = torch.zeros(self.num_envs).to(self.device)
 
         # Create output directory to save images
         if self.cfg.save_imgs:
@@ -406,6 +409,7 @@ class BimanualDirect(DirectRLEnv):
             # Obtain the matrix -> reshape it -> sum the last two dimensions -> 
             #    -> if the value is greater than 0, there is force so  there is contact
             self.contacts[:, idx] = torch.abs(self.scene.sensors[key].data.force_matrix_w).view(self.num_envs, -1, 3).sum(dim = (1,2), keepdim = True).squeeze((-2, -1)) > 0.0
+            self.contact_forces[:, idx, :] = self.scene.sensors[key].data.force_matrix_w.view(self.num_envs, -1, 3).sum(dim=1)
 
 
     # Updates the poses of the object and robots so they can match when performing the grasp
@@ -651,7 +655,12 @@ class BimanualDirect(DirectRLEnv):
         reward = (reward_1) * torch.logical_not(self.obj_reached) + 10*(reward_2) * self.obj_reached + self.cfg.bonus_obj_reach * bonus / 2
 
         # Reward for the contacts
-        reward = reward + contacts_w[:, 1:-1].sum(-1) 
+        # NEW: Force vector contact reward (replaces binary contact reward)
+        force_magnitudes = torch.norm(self.contact_forces, dim=-1)
+        contact_weights = torch.tensor(self.cfg.contact_matrix[0], device=self.device)
+        r_local = (force_magnitudes[:, 1:-1] * contact_weights[1:-1]).sum(-1)
+        r_global = 0.5 * torch.norm(self.contact_forces.sum(dim=1), dim=-1)
+        reward = reward + r_local + r_global
 
         # Reward for reaching target
         bonus_term = self.cfg.bonus_obj_reach * self.obj_reached_target * (contacts_w[:, 1:].sum(-1) > 0.0).int()
