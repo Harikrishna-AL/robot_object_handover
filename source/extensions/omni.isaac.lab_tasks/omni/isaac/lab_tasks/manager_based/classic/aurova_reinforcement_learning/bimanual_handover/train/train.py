@@ -30,6 +30,17 @@ parser.add_argument("--seed", type=int, default=None, help="Seed used for the en
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--train", type=bool, default=True, help="Wether to train or perform normal loop")
 parser.add_argument("--vel_rew", action="store_true", default=False, help="Add velocity penalty reward term")
+parser.add_argument("--use_force_rewards", action="store_true", default=False)
+parser.add_argument("--use_signal_1", action="store_true", default=False)
+parser.add_argument("--use_signal_2", action="store_true", default=False)
+parser.add_argument("--use_signal_instability", action="store_true", default=False)
+parser.add_argument("--F_ref", type=float, default=0.15)
+parser.add_argument("--F_safe", type=float, default=0.35)
+parser.add_argument("--F_threshold", type=float, default=0.10)
+parser.add_argument("--lambda_balance", type=float, default=0.1)
+parser.add_argument("--lambda_instability", type=float, default=0.1)
+parser.add_argument("--lambda_force_excess", type=float, default=0.1)
+parser.add_argument("--palm_weight", type=float, default=0.3)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -106,6 +117,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     if hasattr(args_cli, "vel_rew"):
         env_cfg.vel_rew = args_cli.vel_rew
+
+    env_cfg.use_force_rewards = args_cli.use_force_rewards
+    env_cfg.use_signal_1 = args_cli.use_signal_1
+    env_cfg.use_signal_2 = args_cli.use_signal_2
+    env_cfg.use_signal_instability = args_cli.use_signal_instability
+    env_cfg.F_ref = args_cli.F_ref
+    env_cfg.F_safe = args_cli.F_safe
+    env_cfg.F_threshold = args_cli.F_threshold
+    env_cfg.lambda_balance = args_cli.lambda_balance
+    env_cfg.lambda_instability = args_cli.lambda_instability
+    env_cfg.lambda_force_excess = args_cli.lambda_force_excess
+    env_cfg.palm_weight = args_cli.palm_weight
 
 
     # max iterations for training

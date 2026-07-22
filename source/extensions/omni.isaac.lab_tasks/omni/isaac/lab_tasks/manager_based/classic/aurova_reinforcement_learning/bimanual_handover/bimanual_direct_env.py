@@ -104,6 +104,10 @@ class BimanualDirect(DirectRLEnv):
 
         # Variable to store contacts between prims
         self.contacts = torch.empty(self.num_envs, self.num_contacts).fill_(False).to(self.device)
+        # Force magnitude tracking (raw sensor force norms, current and previous step)
+        self.force_norms = torch.zeros(self.num_envs, len(self.cfg.contact_sensors_dict)).to(self.device)
+        self.prev_force_norms = torch.zeros_like(self.force_norms)
+        self.prev_contacts = torch.zeros_like(self.contacts).float()
 
         # Create output directory to save images
         if self.cfg.save_imgs:
@@ -406,6 +410,12 @@ class BimanualDirect(DirectRLEnv):
             # Obtain the matrix -> reshape it -> sum the last two dimensions -> 
             #    -> if the value is greater than 0, there is force so  there is contact
             self.contacts[:, idx] = torch.abs(self.scene.sensors[key].data.force_matrix_w).view(self.num_envs, -1, 3).sum(dim = (1,2), keepdim = True).squeeze((-2, -1)) > 0.0
+            self.force_norms[:, idx] = (
+                torch.abs(self.scene.sensors[key].data.force_matrix_w)
+                    .view(self.num_envs, -1, 3)
+                    .norm(dim=-1)
+                    .sum(dim=-1)
+            )
 
 
     # Updates the poses of the object and robots so they can match when performing the grasp
@@ -566,6 +576,9 @@ class BimanualDirect(DirectRLEnv):
             - compute_rewards() - torch.tensor(N,1): reward for each environment.
         '''
 
+        # Snapshot previous-step force/contact state before this step overwrites it
+        self.prev_force_norms = self.force_norms.clone()
+        self.prev_contacts = self.contacts.clone().float()
 
         # ---- Variable assignments ----
         rew_scale_hand_obj = self.cfg.rew_scale_hand_obj * torch.ones(self.num_envs).to(self.device)
@@ -610,7 +623,18 @@ class BimanualDirect(DirectRLEnv):
 
         # ---- Flag ----
         # There is contact if the thumb and the fingers (finger collide without the thumb) are in contact
-        contacts_flag = torch.logical_and(contacts_w[:, :-1].sum(-1) - thumb_w.sum(-1) > 0.4, thumb_con)
+        if self.cfg.use_force_rewards and self.cfg.F_threshold > 0:
+            force_normalized = torch.tanh(self.force_norms / self.cfg.F_ref)
+            force_w_trans = force_normalized * self.cfg.contact_matrix
+            thumb_force_w = force_w_trans[:, 10:15].clone()
+            contacts_flag = torch.logical_and(
+                force_w_trans[:, :-1].sum(-1) - thumb_force_w.sum(-1) > self.cfg.F_threshold,
+                thumb_force_w.sum(-1) > 0.0)
+        else:
+            contacts_flag = torch.logical_and(contacts_w[:, :-1].sum(-1) - thumb_w.sum(-1) > 0.4, thumb_con)
+
+        # Detect the exact step the phase transition fires, for metrics (before obj_reached is latched)
+        just_transitioned = torch.logical_and(contacts_flag, torch.logical_not(self.obj_reached))
 
         # Reached flag pre-conditions: if if it did not reach the object befor ...
         bonus = self.obj_reached.clone().bool()
@@ -651,7 +675,35 @@ class BimanualDirect(DirectRLEnv):
         reward = (reward_1) * torch.logical_not(self.obj_reached) + 10*(reward_2) * self.obj_reached + self.cfg.bonus_obj_reach * bonus / 2
 
         # Reward for the contacts
-        reward = reward + contacts_w[:, 1:-1].sum(-1) 
+        reward = reward + contacts_w[:, 1:-1].sum(-1)
+
+        # Signal 1: grasp firmness (force-magnitude-based contact reward)
+        if self.cfg.use_signal_1:
+            force_normalized = torch.tanh(self.force_norms / self.cfg.F_ref)
+            force_w = force_normalized * self.cfg.contact_matrix
+            signal_1_value = force_w[:, 1:-1].sum(-1)
+            reward = reward + signal_1_value
+
+        # Signal 2: thumb opposition balance
+        if self.cfg.use_signal_2:
+            force_normalized = torch.tanh(self.force_norms / self.cfg.F_ref)
+            force_w = force_normalized * self.cfg.contact_matrix
+            thumb_force = force_w[:, 10:15].sum(-1)
+            finger_force = force_w[:, 1:10].sum(-1) + self.cfg.palm_weight * force_w[:, 15:16].sum(-1)
+            balance_ratio = thumb_force / (finger_force + 1e-6)
+            total_grasp_force = force_w[:, 1:15].sum(-1)
+            balance_active = (total_grasp_force > self.cfg.F_threshold).float()
+            r_balance = -self.cfg.lambda_balance * torch.abs(balance_ratio - 1.0) * self.obj_reached.float() * balance_active
+            reward = reward + r_balance
+
+        # Signal instability: penalize sudden contact-pattern changes with force drop
+        if self.cfg.use_signal_instability:
+            pattern_change = (self.contacts[:, 1:-1].float() - self.prev_contacts[:, 1:-1]).abs().sum(-1)
+            current_total = self.force_norms[:, 1:-1].sum(-1)
+            prev_total = self.prev_force_norms[:, 1:-1].sum(-1)
+            force_drop = torch.relu(prev_total - current_total)
+            r_instability = -self.cfg.lambda_instability * pattern_change * force_drop * self.obj_reached.float()
+            reward = reward + r_instability
 
         # Reward for reaching target
         bonus_term = self.cfg.bonus_obj_reach * self.obj_reached_target * (contacts_w[:, 1:].sum(-1) > 0.0).int()
@@ -670,11 +722,16 @@ class BimanualDirect(DirectRLEnv):
             # 4. Calculate the distance-conditioned penalty
             lambda_vel = self.cfg.lambda_vel
             k_decay = self.cfg.k_decay
-            velocity_penalty = lambda_vel * (excess_vel ** 2) * torch.exp(-k_decay * hand_obj_dist[:, 0])
+            velocity_penalty = lambda_vel * (excess_vel ** 2) * torch.exp(-k_decay * hand_obj_dist[:, 0]) * torch.logical_not(self.obj_reached).float()
     
             # 5. Subtract from final reward
             reward = reward - velocity_penalty
 
+        # Excessive force penalty (master-switch gated, applies regardless of which signals are active)
+        if self.cfg.use_force_rewards:
+            excess_force = torch.relu(self.force_norms[:, 1:-1] - self.cfg.F_safe)
+            r_excess = -self.cfg.lambda_force_excess * excess_force.sum(-1)
+            reward = reward + r_excess
 
         # Update previous distances
         self.prev_dist = hand_obj_dist[:, 0]
@@ -695,7 +752,24 @@ class BimanualDirect(DirectRLEnv):
         
         if self.cfg.vel_rew:
             self.extras["log"]["reward_terms/velocity_penalty"] = velocity_penalty.mean().item()
-            
+
+        if self.cfg.use_signal_1:
+            self.extras["log"]["reward_terms/signal_1_firmness"] = signal_1_value.mean().item()
+
+        if self.cfg.use_signal_2:
+            self.extras["log"]["reward_terms/signal_2_balance"] = r_balance.mean().item()
+
+        if self.cfg.use_signal_instability:
+            self.extras["log"]["reward_terms/signal_instability"] = r_instability.mean().item()
+
+        if self.cfg.use_force_rewards:
+            self.extras["log"]["reward_terms/force_excess"] = r_excess.mean().item()
+
+        self.extras["log"]["metrics/force_at_transition"] = (
+            self.force_norms[:, 1:15][just_transitioned].sum(-1).mean().item() if just_transitioned.any() else 0.0)
+        self.extras["log"]["metrics/velocity_at_transition"] = (
+            ee_vel_norm[just_transitioned].mean().item() if just_transitioned.any() else 0.0)
+
         return reward
     
 
@@ -729,6 +803,18 @@ class BimanualDirect(DirectRLEnv):
         # Truncated and terminated variables
         truncated = torch.logical_or(torch.logical_or(falling, out_of_bounds), GEN3_ground_contact)
         terminated = torch.logical_or(time_out, self.obj_reached_target)
+
+        # Outcome classification for logging
+        success = self.obj_reached_target & ~truncated
+        indet = self.obj_reached_target & truncated
+        fail = ~self.obj_reached_target & (terminated | truncated)
+
+        if "log" not in self.extras:
+            self.extras["log"] = dict()
+
+        self.extras["log"]["metrics/outcome_success"] = success.float().mean().item()
+        self.extras["log"]["metrics/outcome_indetermination"] = indet.float().mean().item()
+        self.extras["log"]["metrics/outcome_fail"] = fail.float().mean().item()
 
         if "log" in self.extras:
             self.extras["log"]["metrics/out_of_bounds"] = out_of_bounds.float().mean().item()

@@ -290,6 +290,23 @@ class BimanualDirectCfg(DirectRLEnvCfg):
     lambda_vel: float = 5.0
     k_decay: float = 13.0
 
+    # Force reward flags
+    use_force_rewards: bool = False
+    use_signal_1: bool = False
+    use_signal_2: bool = False
+    use_signal_instability: bool = False
+
+    # Force constants (measured from checkpoint)
+    F_ref: float = 0.15
+    F_safe: float = 0.35
+    F_threshold: float = 0.10
+
+    # Scaling constants
+    lambda_balance: float = 0.1
+    lambda_instability: float = 0.1
+    lambda_force_excess: float = 0.1
+    palm_weight: float = 0.3
+
 
 
 
