@@ -684,6 +684,18 @@ class BimanualDirect(DirectRLEnv):
             signal_1_value = force_w[:, 1:-1].sum(-1)
             reward = reward + signal_1_value
 
+        # Signal 2: thumb opposition balance
+        if self.cfg.use_signal_2:
+            force_normalized = torch.tanh(self.force_norms / self.cfg.F_ref)
+            force_w = force_normalized * self.cfg.contact_matrix
+            thumb_force = force_w[:, 10:15].sum(-1)
+            finger_force = force_w[:, 1:10].sum(-1) + self.cfg.palm_weight * force_w[:, 15:16].sum(-1)
+            balance_ratio = thumb_force / (finger_force + 1e-6)
+            total_grasp_force = force_w[:, 1:15].sum(-1)
+            balance_active = (total_grasp_force > self.cfg.F_threshold).float()
+            r_balance = -self.cfg.lambda_balance * torch.abs(balance_ratio - 1.0) * self.obj_reached.float() * balance_active
+            reward = reward + r_balance
+
         # Reward for reaching target
         bonus_term = self.cfg.bonus_obj_reach * self.obj_reached_target * (contacts_w[:, 1:].sum(-1) > 0.0).int()
         reward = reward + bonus_term
