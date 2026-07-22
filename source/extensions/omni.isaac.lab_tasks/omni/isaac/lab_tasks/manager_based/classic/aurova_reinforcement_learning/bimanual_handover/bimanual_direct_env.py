@@ -696,6 +696,15 @@ class BimanualDirect(DirectRLEnv):
             r_balance = -self.cfg.lambda_balance * torch.abs(balance_ratio - 1.0) * self.obj_reached.float() * balance_active
             reward = reward + r_balance
 
+        # Signal instability: penalize sudden contact-pattern changes with force drop
+        if self.cfg.use_signal_instability:
+            pattern_change = (self.contacts[:, 1:-1].float() - self.prev_contacts[:, 1:-1]).abs().sum(-1)
+            current_total = self.force_norms[:, 1:-1].sum(-1)
+            prev_total = self.prev_force_norms[:, 1:-1].sum(-1)
+            force_drop = torch.relu(prev_total - current_total)
+            r_instability = -self.cfg.lambda_instability * pattern_change * force_drop * self.obj_reached.float()
+            reward = reward + r_instability
+
         # Reward for reaching target
         bonus_term = self.cfg.bonus_obj_reach * self.obj_reached_target * (contacts_w[:, 1:].sum(-1) > 0.0).int()
         reward = reward + bonus_term
