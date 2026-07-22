@@ -670,7 +670,7 @@ class BimanualDirect(DirectRLEnv):
             # 4. Calculate the distance-conditioned penalty
             lambda_vel = self.cfg.lambda_vel
             k_decay = self.cfg.k_decay
-            velocity_penalty = lambda_vel * (excess_vel ** 2) * torch.exp(-k_decay * hand_obj_dist[:, 0])
+            velocity_penalty = lambda_vel * (excess_vel ** 2) * torch.exp(-k_decay * hand_obj_dist[:, 0]) * torch.logical_not(self.obj_reached).float()
     
             # 5. Subtract from final reward
             reward = reward - velocity_penalty
