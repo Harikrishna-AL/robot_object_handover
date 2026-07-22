@@ -727,6 +727,11 @@ class BimanualDirect(DirectRLEnv):
             # 5. Subtract from final reward
             reward = reward - velocity_penalty
 
+        # Excessive force penalty (master-switch gated, applies regardless of which signals are active)
+        if self.cfg.use_force_rewards:
+            excess_force = torch.relu(self.force_norms[:, 1:-1] - self.cfg.F_safe)
+            r_excess = -self.cfg.lambda_force_excess * excess_force.sum(-1)
+            reward = reward + r_excess
 
         # Update previous distances
         self.prev_dist = hand_obj_dist[:, 0]
