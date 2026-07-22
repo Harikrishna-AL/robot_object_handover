@@ -576,6 +576,9 @@ class BimanualDirect(DirectRLEnv):
             - compute_rewards() - torch.tensor(N,1): reward for each environment.
         '''
 
+        # Snapshot previous-step force/contact state before this step overwrites it
+        self.prev_force_norms = self.force_norms.clone()
+        self.prev_contacts = self.contacts.clone().float()
 
         # ---- Variable assignments ----
         rew_scale_hand_obj = self.cfg.rew_scale_hand_obj * torch.ones(self.num_envs).to(self.device)
@@ -620,7 +623,18 @@ class BimanualDirect(DirectRLEnv):
 
         # ---- Flag ----
         # There is contact if the thumb and the fingers (finger collide without the thumb) are in contact
-        contacts_flag = torch.logical_and(contacts_w[:, :-1].sum(-1) - thumb_w.sum(-1) > 0.4, thumb_con)
+        if self.cfg.use_force_rewards and self.cfg.F_threshold > 0:
+            force_normalized = torch.tanh(self.force_norms / self.cfg.F_ref)
+            force_w_trans = force_normalized * self.cfg.contact_matrix
+            thumb_force_w = force_w_trans[:, 10:15].clone()
+            contacts_flag = torch.logical_and(
+                force_w_trans[:, :-1].sum(-1) - thumb_force_w.sum(-1) > self.cfg.F_threshold,
+                thumb_force_w.sum(-1) > 0.0)
+        else:
+            contacts_flag = torch.logical_and(contacts_w[:, :-1].sum(-1) - thumb_w.sum(-1) > 0.4, thumb_con)
+
+        # Detect the exact step the phase transition fires, for metrics (before obj_reached is latched)
+        just_transitioned = torch.logical_and(contacts_flag, torch.logical_not(self.obj_reached))
 
         # Reached flag pre-conditions: if if it did not reach the object befor ...
         bonus = self.obj_reached.clone().bool()
