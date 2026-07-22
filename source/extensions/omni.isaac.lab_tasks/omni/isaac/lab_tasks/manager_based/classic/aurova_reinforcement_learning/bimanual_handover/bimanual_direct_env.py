@@ -752,7 +752,24 @@ class BimanualDirect(DirectRLEnv):
         
         if self.cfg.vel_rew:
             self.extras["log"]["reward_terms/velocity_penalty"] = velocity_penalty.mean().item()
-            
+
+        if self.cfg.use_signal_1:
+            self.extras["log"]["reward_terms/signal_1_firmness"] = signal_1_value.mean().item()
+
+        if self.cfg.use_signal_2:
+            self.extras["log"]["reward_terms/signal_2_balance"] = r_balance.mean().item()
+
+        if self.cfg.use_signal_instability:
+            self.extras["log"]["reward_terms/signal_instability"] = r_instability.mean().item()
+
+        if self.cfg.use_force_rewards:
+            self.extras["log"]["reward_terms/force_excess"] = r_excess.mean().item()
+
+        self.extras["log"]["metrics/force_at_transition"] = (
+            self.force_norms[:, 1:15][just_transitioned].sum(-1).mean().item() if just_transitioned.any() else 0.0)
+        self.extras["log"]["metrics/velocity_at_transition"] = (
+            ee_vel_norm[just_transitioned].mean().item() if just_transitioned.any() else 0.0)
+
         return reward
     
 
