@@ -675,7 +675,14 @@ class BimanualDirect(DirectRLEnv):
         reward = (reward_1) * torch.logical_not(self.obj_reached) + 10*(reward_2) * self.obj_reached + self.cfg.bonus_obj_reach * bonus / 2
 
         # Reward for the contacts
-        reward = reward + contacts_w[:, 1:-1].sum(-1) 
+        reward = reward + contacts_w[:, 1:-1].sum(-1)
+
+        # Signal 1: grasp firmness (force-magnitude-based contact reward)
+        if self.cfg.use_signal_1:
+            force_normalized = torch.tanh(self.force_norms / self.cfg.F_ref)
+            force_w = force_normalized * self.cfg.contact_matrix
+            signal_1_value = force_w[:, 1:-1].sum(-1)
+            reward = reward + signal_1_value
 
         # Reward for reaching target
         bonus_term = self.cfg.bonus_obj_reach * self.obj_reached_target * (contacts_w[:, 1:].sum(-1) > 0.0).int()
