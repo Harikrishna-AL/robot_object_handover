@@ -804,6 +804,18 @@ class BimanualDirect(DirectRLEnv):
         truncated = torch.logical_or(torch.logical_or(falling, out_of_bounds), GEN3_ground_contact)
         terminated = torch.logical_or(time_out, self.obj_reached_target)
 
+        # Outcome classification for logging
+        success = self.obj_reached_target & ~truncated
+        indet = self.obj_reached_target & truncated
+        fail = ~self.obj_reached_target & (terminated | truncated)
+
+        if "log" not in self.extras:
+            self.extras["log"] = dict()
+
+        self.extras["log"]["metrics/outcome_success"] = success.float().mean().item()
+        self.extras["log"]["metrics/outcome_indetermination"] = indet.float().mean().item()
+        self.extras["log"]["metrics/outcome_fail"] = fail.float().mean().item()
+
         if "log" in self.extras:
             self.extras["log"]["metrics/out_of_bounds"] = out_of_bounds.float().mean().item()
 
