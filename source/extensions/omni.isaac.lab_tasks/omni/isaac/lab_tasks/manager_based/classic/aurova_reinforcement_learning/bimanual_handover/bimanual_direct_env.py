@@ -104,6 +104,10 @@ class BimanualDirect(DirectRLEnv):
 
         # Variable to store contacts between prims
         self.contacts = torch.empty(self.num_envs, self.num_contacts).fill_(False).to(self.device)
+        # Force magnitude tracking (raw sensor force norms, current and previous step)
+        self.force_norms = torch.zeros(self.num_envs, len(self.cfg.contact_sensors_dict)).to(self.device)
+        self.prev_force_norms = torch.zeros_like(self.force_norms)
+        self.prev_contacts = torch.zeros_like(self.contacts).float()
 
         # Create output directory to save images
         if self.cfg.save_imgs:
@@ -406,6 +410,12 @@ class BimanualDirect(DirectRLEnv):
             # Obtain the matrix -> reshape it -> sum the last two dimensions -> 
             #    -> if the value is greater than 0, there is force so  there is contact
             self.contacts[:, idx] = torch.abs(self.scene.sensors[key].data.force_matrix_w).view(self.num_envs, -1, 3).sum(dim = (1,2), keepdim = True).squeeze((-2, -1)) > 0.0
+            self.force_norms[:, idx] = (
+                torch.abs(self.scene.sensors[key].data.force_matrix_w)
+                    .view(self.num_envs, -1, 3)
+                    .norm(dim=-1)
+                    .sum(dim=-1)
+            )
 
 
     # Updates the poses of the object and robots so they can match when performing the grasp
