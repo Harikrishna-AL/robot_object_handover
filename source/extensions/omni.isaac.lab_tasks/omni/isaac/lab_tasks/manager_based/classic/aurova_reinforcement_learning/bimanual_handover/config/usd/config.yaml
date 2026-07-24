@@ -1,5 +1,5 @@
-asset_path: /workspace/isaaclab/source/extensions/omni.isaac.lab_tasks/omni/isaac/lab_tasks/manager_based/classic/aurova_reinforcement_learning/bimanual_handover/config/urdf/gen3_4f.urdf
-usd_dir: /workspace/isaaclab/source/extensions/omni.isaac.lab_tasks/omni/isaac/lab_tasks/manager_based/classic/aurova_reinforcement_learning/bimanual_handover/config/usd
+asset_path: /home/hapi039h/isaaclab/source/extensions/omni.isaac.lab_tasks/omni/isaac/lab_tasks/manager_based/classic/aurova_reinforcement_learning/bimanual_handover/config/urdf/gen3_4f.urdf
+usd_dir: /home/hapi039h/isaaclab/source/extensions/omni.isaac.lab_tasks/omni/isaac/lab_tasks/manager_based/classic/aurova_reinforcement_learning/bimanual_handover/config/usd
 usd_file_name: gen3_4f.usd
 force_usd_conversion: true
 make_instanceable: true

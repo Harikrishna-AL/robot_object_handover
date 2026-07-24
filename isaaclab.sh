@@ -106,8 +106,8 @@ install_isaaclab_extension() {
         echo -e "\t module: $1"
         
         # IMPORTANTE: he añadido esta movida
-        /workspace/isaaclab/_isaac_sim/kit/python/bin/python3 -m ensurepip
-        /workspace/isaaclab/_isaac_sim/kit/python/bin/python3 -m pip install --upgrade pip
+        ${ISAACLAB_PATH}/_isaac_sim/kit/python/bin/python3 -m ensurepip
+        ${ISAACLAB_PATH}/_isaac_sim/kit/python/bin/python3 -m pip install --upgrade pip
 
 
         ${python_exe} -m pip install --editable $1

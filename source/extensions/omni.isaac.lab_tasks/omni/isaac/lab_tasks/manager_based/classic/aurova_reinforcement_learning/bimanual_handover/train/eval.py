@@ -43,7 +43,7 @@ def main():
     env = gym.make(args_cli.task, cfg = env_cfg)
     
     # Filter models
-    path_to_train = "/workspace/isaaclab/source/extensions/omni.isaac.lab_tasks/omni/isaac/lab_tasks/manager_based/classic/aurova_reinforcement_learning/bimanual_handover/train/logs/"
+    path_to_train = "/home/hapi039h/isaaclab/source/extensions/omni.isaac.lab_tasks/omni/isaac/lab_tasks/manager_based/classic/aurova_reinforcement_learning/bimanual_handover/train/logs/"
     
     dir = os.path.join(path_to_train, args_cli.model_dir)
     dir2 = os.path.join(path_to_train, args_cli.model_dir2)
