@@ -117,6 +117,7 @@ class BimanualDirectCfg(DirectRLEnvCfg):
             mass_props=sim_utils.MassPropertiesCfg(mass=0.00025),
             collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled = True,
                                                             contact_offset=0.001),
+            # physics_material=sim_utils.RigidBodyMaterialCfg(friction_combine_mode="max", static_friction=3.0, dynamic_friction=3.0),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0), metallic=0.2),
         ),
         # spawn=sim_utils.CylinderCfg(
