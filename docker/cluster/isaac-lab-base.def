@@ -1,0 +1,93 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/isaac-sim:4.2.0
+
+# Apptainer equivalent of docker/Dockerfile.base, built directly on the cluster
+# (no Docker daemon involved). The repo itself is NOT copied in at build time;
+# run_singularity.sh bind-mounts the synced repo to /workspace/isaaclab at job
+# runtime, same as the Docker-based workflow. This build only needs a copy of
+# the repo present on disk (ISAACLAB_PATH below) so `isaaclab.sh --install` can
+# resolve and pip-install each extension's setup.py.
+#
+# Build on a Capella compute node (capella-interactive), not the login node:
+#   apptainer build --fakeroot isaac-lab-base.sif isaac-lab-base.def
+
+%arguments
+    ISAACSIM_ROOT_PATH=/isaac-sim
+    ISAACLAB_PATH=/workspace/isaaclab
+    DOCKER_USER_HOME=/root
+
+%environment
+    export ISAACSIM_ROOT_PATH=/isaac-sim
+    export ISAACLAB_PATH=/workspace/isaaclab
+    export DOCKER_USER_HOME=/root
+    export LANG=C.UTF-8
+    export ISAACSIM_PATH=/workspace/isaaclab/_isaac_sim
+    export OMNI_KIT_ALLOW_ROOT=1
+
+%files
+    # synced repo checked out at build time on the cluster filesystem
+    /data/cat/ws/eske352h-isaaclab/isaaclab /workspace/isaaclab
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    ISAACSIM_ROOT_PATH=/isaac-sim
+    ISAACLAB_PATH=/workspace/isaaclab
+    DOCKER_USER_HOME=/root
+
+    # same apt packages as Dockerfile.base
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        git \
+        libglib2.0-0 \
+        ncurses-term
+    apt -y autoremove && apt clean autoclean && rm -rf /var/lib/apt/lists/*
+
+    # symlink installed Isaac Sim into the Isaac Lab dir
+    ln -sf ${ISAACSIM_ROOT_PATH} ${ISAACLAB_PATH}/_isaac_sim
+
+    # apt deps declared by extensions' extension.toml
+    ${ISAACLAB_PATH}/isaaclab.sh -p ${ISAACLAB_PATH}/tools/install_deps.py apt ${ISAACLAB_PATH}/source/extensions
+    apt -y autoremove && apt clean autoclean && rm -rf /var/lib/apt/lists/*
+
+    # bind-mount targets for singularity/apptainer usage
+    mkdir -p ${ISAACSIM_ROOT_PATH}/kit/cache
+    mkdir -p ${DOCKER_USER_HOME}/.cache/ov
+    mkdir -p ${DOCKER_USER_HOME}/.cache/pip
+    mkdir -p ${DOCKER_USER_HOME}/.cache/nvidia/GLCache
+    mkdir -p ${DOCKER_USER_HOME}/.nv/ComputeCache
+    mkdir -p ${DOCKER_USER_HOME}/.nvidia-omniverse/logs
+    mkdir -p ${DOCKER_USER_HOME}/.local/share/ov/data
+    mkdir -p ${DOCKER_USER_HOME}/Documents
+
+    # NVIDIA binary placeholders required for singularity/apptainer --nv usage
+    touch /bin/nvidia-smi
+    touch /bin/nvidia-debugdump
+    touch /bin/nvidia-persistenced
+    touch /bin/nvidia-cuda-mps-control
+    touch /bin/nvidia-cuda-mps-server
+    touch /etc/localtime
+    mkdir -p /var/run/nvidia-persistenced
+    touch /var/run/nvidia-persistenced/socket
+
+    # base IsaacLab extension install (editable installs via each extension's setup.py)
+    ${ISAACLAB_PATH}/isaaclab.sh --install
+
+    # train.py (bimanual_handover) needs stable-baselines3 + wandb, neither of
+    # which are pulled in by the base `isaaclab.sh --install` above: sb3 is only
+    # declared as the lab_tasks extension's optional "sb3" extra, and wandb isn't
+    # declared anywhere despite being imported directly in train.py.
+    ${ISAACLAB_PATH}/_isaac_sim/python.sh -m pip install "stable-baselines3>=2.1" wandb
+
+    # convenience aliases
+    echo "export ISAACLAB_PATH=${ISAACLAB_PATH}" >> ${HOME}/.bashrc
+    echo "alias isaaclab=${ISAACLAB_PATH}/isaaclab.sh" >> ${HOME}/.bashrc
+    echo "alias python=${ISAACLAB_PATH}/_isaac_sim/python.sh" >> ${HOME}/.bashrc
+    echo "alias python3=${ISAACLAB_PATH}/_isaac_sim/python.sh" >> ${HOME}/.bashrc
+    echo "alias pip='${ISAACLAB_PATH}/_isaac_sim/python.sh -m pip'" >> ${HOME}/.bashrc
+    echo "alias pip3='${ISAACLAB_PATH}/_isaac_sim/python.sh -m pip'" >> ${HOME}/.bashrc
+    echo "alias tensorboard='${ISAACLAB_PATH}/_isaac_sim/python.sh ${ISAACLAB_PATH}/_isaac_sim/tensorboard'" >> ${HOME}/.bashrc
+    echo "export TZ=$(date +%Z)" >> ${HOME}/.bashrc
+
+%runscript
+    exec /bin/bash "$@"
