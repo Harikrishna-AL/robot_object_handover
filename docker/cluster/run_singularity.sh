@@ -51,6 +51,11 @@ cp -r $1 $TMPDIR
 # Get the directory name
 dir_name=$(basename "$1")
 
+# the bind-mount below (-B $TMPDIR/$dir_name:/workspace/isaaclab) replaces whatever
+# was baked into the image at /workspace/isaaclab, including the _isaac_sim symlink
+# created at build time. Recreate it here so it exists in the mounted copy too.
+ln -sf ${DOCKER_ISAACSIM_ROOT_PATH} $TMPDIR/$dir_name/_isaac_sim
+
 # copy the pre-built .sif to the compute node (built directly with `apptainer build`,
 # not via the docker push/tar workflow, so there is no .tar to extract here)
 cp $CLUSTER_SIF_PATH/$2.sif $TMPDIR/$2.sif
