@@ -51,8 +51,9 @@ cp -r $1 $TMPDIR
 # Get the directory name
 dir_name=$(basename "$1")
 
-# copy container to the compute node
-tar -xf $CLUSTER_SIF_PATH/$2.tar  -C $TMPDIR
+# copy the pre-built .sif to the compute node (built directly with `apptainer build`,
+# not via the docker push/tar workflow, so there is no .tar to extract here)
+cp $CLUSTER_SIF_PATH/$2.sif $TMPDIR/$2.sif
 
 # execute command in singularity container
 # NOTE: ISAACLAB_PATH is normally set in `isaaclab.sh` but we directly call the isaac-sim python because we sync the entire
