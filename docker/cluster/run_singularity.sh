@@ -82,8 +82,8 @@ singularity exec \
     -B $TMPDIR/$dir_name:/workspace/isaaclab:rw \
     -B $CLUSTER_ISAACLAB_DIR/logs:/workspace/isaaclab/logs:rw \
     -B $BIMANUAL_TRAIN_LOGS_DIR:/workspace/isaaclab/source/extensions/omni.isaac.lab_tasks/omni/isaac/lab_tasks/manager_based/classic/aurova_reinforcement_learning/bimanual_handover/train/logs:rw \
-    --nv --writable --containall $TMPDIR/$2.sif \
-    bash -c "export ISAACLAB_PATH=/workspace/isaaclab && cd /workspace/isaaclab && /isaac-sim/python.sh ${CLUSTER_PYTHON_EXECUTABLE} ${@:3}"
+    --nv --containall $TMPDIR/$2.sif \
+    bash -c 'export ISAACLAB_PATH=/workspace/isaaclab && export WANDB_MODE=offline && export WANDB_DIR=/workspace/isaaclab/logs && cd /workspace/isaaclab && /isaac-sim/python.sh '"${CLUSTER_PYTHON_EXECUTABLE}"' "$@"' -- "${@:3}"
 
 # copy resulting cache files back to host
 rsync -azPv $TMPDIR/docker-isaac-sim $CLUSTER_ISAAC_SIM_CACHE_DIR/..
