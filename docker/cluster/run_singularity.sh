@@ -46,6 +46,13 @@ cp -r $CLUSTER_ISAAC_SIM_CACHE_DIR $TMPDIR
 mkdir -p "$CLUSTER_ISAACLAB_DIR/logs"
 touch "$CLUSTER_ISAACLAB_DIR/logs/.keep"
 
+# train.py hardcodes its checkpoint/log output under the repo's own
+# .../bimanual_handover/train/logs directory rather than /workspace/isaaclab/logs.
+# Without binding this to persistent storage, checkpoints and the final model
+# would be written to $TMPDIR (node-local scratch) and lost when the job ends.
+BIMANUAL_TRAIN_LOGS_DIR="$CLUSTER_ISAACLAB_DIR/bimanual_train_logs"
+mkdir -p "$BIMANUAL_TRAIN_LOGS_DIR"
+
 # copy the temporary isaaclab directory with the latest changes to the compute node
 cp -r $1 $TMPDIR
 # Get the directory name
@@ -74,6 +81,7 @@ singularity exec \
     -B $TMPDIR/docker-isaac-sim/documents:${DOCKER_USER_HOME}/Documents:rw \
     -B $TMPDIR/$dir_name:/workspace/isaaclab:rw \
     -B $CLUSTER_ISAACLAB_DIR/logs:/workspace/isaaclab/logs:rw \
+    -B $BIMANUAL_TRAIN_LOGS_DIR:/workspace/isaaclab/source/extensions/omni.isaac.lab_tasks/omni/isaac/lab_tasks/manager_based/classic/aurova_reinforcement_learning/bimanual_handover/train/logs:rw \
     --nv --writable --containall $TMPDIR/$2.sif \
     bash -c "export ISAACLAB_PATH=/workspace/isaaclab && cd /workspace/isaaclab && /isaac-sim/python.sh ${CLUSTER_PYTHON_EXECUTABLE} ${@:3}"
 
