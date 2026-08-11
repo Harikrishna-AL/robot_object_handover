@@ -1,0 +1,14 @@
+# Environment / secrets
+.env
+*.env
+!docker/.env.base
+!docker/.env.ros2
+!docker/cluster/.env.cluster
+
+# Local scratch: downloaded videos, frames, tensorboard dumps pulled from the cluster for inspection
+downloaded_videos/
+
+# Common Python/IsaacLab artifacts
+__pycache__/
+*.pyc
+*.egg-info/
