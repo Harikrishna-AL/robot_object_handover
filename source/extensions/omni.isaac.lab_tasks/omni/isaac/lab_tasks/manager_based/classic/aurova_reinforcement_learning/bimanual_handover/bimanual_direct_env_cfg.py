@@ -13,6 +13,7 @@ from .mdp.utils import compute_rewards, save_images_grid
 import omni.isaac.lab.sim as sim_utils
 from omni.isaac.lab.assets import Articulation
 from omni.isaac.lab.envs import DirectRLEnvCfg
+from omni.isaac.lab.envs.common import ViewerCfg
 from omni.isaac.lab.scene import InteractiveSceneCfg
 from omni.isaac.lab.sim import SimulationCfg
 from omni.isaac.lab.utils import configclass
@@ -174,6 +175,19 @@ class BimanualDirectCfg(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs = num_envs, env_spacing = 2.5, replicate_physics = True)
+
+    # viewer camera: pinned to a single env's spawn origin so recorded video stays a
+    # close, readable shot of one handover regardless of how many envs are running.
+    # GEN3 base is at env-local x=-1.25, UR5e base is at env-local x=0 (its init_state
+    # has no pos override), so their midpoint is x=-0.625. eye/lookat sit off to the
+    # side (+y) of that arm-to-arm axis rather than in the plane the arms reach through.
+    viewer: ViewerCfg = ViewerCfg(
+        eye=(-0.625, 1.3, 1.0),
+        lookat=(-0.625, 0.0, 0.7),
+        origin_type="env",
+        env_index=0,
+        resolution=(1280, 720),
+    )
     # InteractiveSceneCfg: Configuration for the interactive scene.
     #    num_envs: Number of environment instances handled by the scene.
     #    env_spacing: Spacing between environments. --> Positions are automatically handled
