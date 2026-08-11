@@ -60,6 +60,14 @@ From: nvcr.io/nvidia/isaac-sim:4.2.0
     mkdir -p ${DOCKER_USER_HOME}/.local/share/ov/data
     mkdir -p ${DOCKER_USER_HOME}/Documents
 
+    # bind-mount targets under the repo itself: Apptainer's --containall bind-mount
+    # hangs indefinitely (diagnosed 2026-08-10) when the container target path does
+    # not already exist in the read-only squashfs image, since it must be synthesized
+    # in the overlay layer on the fly. Pre-create both log targets so the bind-mounts
+    # in run_singularity.sh attach to an existing directory instead.
+    mkdir -p ${ISAACLAB_PATH}/logs
+    mkdir -p ${ISAACLAB_PATH}/source/extensions/omni.isaac.lab_tasks/omni/isaac/lab_tasks/manager_based/classic/aurova_reinforcement_learning/bimanual_handover/train/logs
+
     # NVIDIA binary placeholders required for singularity/apptainer --nv usage
     touch /bin/nvidia-smi
     touch /bin/nvidia-debugdump
