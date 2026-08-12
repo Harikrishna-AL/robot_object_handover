@@ -26,7 +26,7 @@ From: nvcr.io/nvidia/isaac-sim:4.2.0
 
 %files
     # synced repo checked out at build time on the cluster filesystem
-    /data/cat/ws/eske352h-isaaclab/isaaclab /workspace/isaaclab
+    /data/cat/ws/hapi039h-isaac/isaaclab /workspace/isaaclab
 
 %post
     export DEBIAN_FRONTEND=noninteractive

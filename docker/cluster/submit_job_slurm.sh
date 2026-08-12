@@ -16,7 +16,7 @@ cat <<EOT > job.sh
 #SBATCH --time=23:00:00
 #SBATCH --mem-per-cpu=4048
 #SBATCH --mail-type=END
-#SBATCH --mail-user=eshaanethics@gmail.com
+#SBATCH --mail-user=hari3032003@gmail.com
 #SBATCH --job-name="training-$(date +"%Y-%m-%dT%H:%M")"
 
 # Pass the container profile first to run_singularity.sh, then all arguments intended for the executed script

@@ -60,19 +60,36 @@ mkdir -p "$PERSIST_JOB_LOGS_DIR" "$PERSIST_BIMANUAL_TRAIN_LOGS_DIR"
 LOCAL_CACHE_DIR="$TMPDIR/local_cache"
 mkdir -p "$LOCAL_CACHE_DIR/kit" "$LOCAL_CACHE_DIR/glcache" "$LOCAL_CACHE_DIR/computecache" "$LOCAL_CACHE_DIR/ov" "$LOCAL_CACHE_DIR/pip"
 
-# copy the temporary isaaclab directory with the latest changes to the compute node
-cp -r $1 $TMPDIR
-# Get the directory name
-dir_name=$(basename "$1")
+# copy the temporary isaaclab directory with the latest changes to the compute node.
+# Destination is job-ID-scoped, not just basename($1): $TMPDIR on this cluster is
+# plain node-local /tmp, not a private per-job scratch dir, so a generic name like
+# "isaaclab" can collide with leftover (possibly root-owned, from a previous
+# --fakeroot run) debris from an earlier job -- ours or another user's entirely --
+# that landed on the same node. Diagnosed 2026-08-12 (job 3887518): cp/rm/ln all
+# failed with Permission denied against pre-existing files at $TMPDIR/isaaclab.
+dir_name="isaaclab_${SLURM_JOB_ID:-$$}"
+cp -r "$1" "$TMPDIR/$dir_name"
 
 # the bind-mount below (-B $TMPDIR/$dir_name:/workspace/isaaclab) replaces whatever
 # was baked into the image at /workspace/isaaclab, including the _isaac_sim symlink
 # created at build time. Recreate it here so it exists in the mounted copy too.
 ln -sf ${DOCKER_ISAACSIM_ROOT_PATH} $TMPDIR/$dir_name/_isaac_sim
 
+# Same overwrite problem as _isaac_sim above, for the newer train/logs bind
+# mount (added alongside this fix): the outer /workspace/isaaclab bind-mount
+# replaces the image's pre-created (via isaac-lab-base.def %post) empty
+# train/logs directory with this fresh host copy, which has no such directory
+# since it's pure runtime output, never git-tracked. Pre-create it here too
+# so the later, more specific bind-mount below has a target to attach to.
+mkdir -p $TMPDIR/$dir_name/source/extensions/omni.isaac.lab_tasks/omni/isaac/lab_tasks/manager_based/classic/aurova_reinforcement_learning/bimanual_handover/train/logs
+
 # copy the pre-built .sif to the compute node (built directly with `apptainer build`,
-# not via the docker push/tar workflow, so there is no .tar to extract here)
-cp $CLUSTER_SIF_PATH/$2.sif $TMPDIR/$2.sif
+# not via the docker push/tar workflow, so there is no .tar to extract here).
+# Job-ID-scoped destination for the same reason as $dir_name above: a plain
+# $2.sif name previously collided with root-owned leftovers on shared node-local
+# /tmp from an earlier --fakeroot build that wrote directly to this same path.
+sif_name="${2}_${SLURM_JOB_ID:-$$}.sif"
+cp $CLUSTER_SIF_PATH/$2.sif $TMPDIR/$sif_name
 
 # Background sync: copy checkpoints/logs/video from local $TMPDIR to Weka
 # periodically WHILE training runs, not just after it exits. A time-limit
@@ -108,7 +125,7 @@ singularity exec \
     -B $LOCAL_CACHE_DIR/computecache:${DOCKER_USER_HOME}/.nv/ComputeCache:rw \
     -B $LOCAL_CACHE_DIR/ov:${DOCKER_USER_HOME}/.cache/ov:rw \
     -B $LOCAL_CACHE_DIR/pip:${DOCKER_USER_HOME}/.cache/pip:rw \
-    --nv --containall $TMPDIR/$2.sif \
+    --nv --containall $TMPDIR/$sif_name \
     bash -c 'export ISAACLAB_PATH=/workspace/isaaclab && export WANDB_MODE=online && export WANDB_DIR=/workspace/isaaclab/logs && export WANDB_API_KEY='"${WANDB_API_KEY}"' && cd /workspace/isaaclab && /isaac-sim/python.sh '"${CLUSTER_PYTHON_EXECUTABLE}"' "$@"' -- "${@:3}"
 # WANDB_MODE=online (2026-08-10): re-verified that Capella compute nodes
 # DO have outbound internet -- confirmed by reaching api.wandb.ai/graphql
