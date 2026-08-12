@@ -2,7 +2,10 @@
 seed: 64
 
 n_timesteps: !!float 6e8      # Total timesteps in which the agent will learn
-policy: 'MlpPolicy'           # Type of Policy
+# NOTE: train.py used to hardcode CustomActorCriticPolicy regardless of this
+# field. It now resolves the policy class from this string (see train.py),
+# so this must keep naming the class actually used, not SB3's builtin alias.
+policy: 'CustomActorCriticPolicy'
 n_steps: 16                   # The number of steps to run for each environment per update (i.e. rollout buffer size is n_steps * n_envs where n_envs is number of environment copies running in parallel)
 batch_size: 4096              # Minibatch size
 gae_lambda: 0.95              # Factor for trade-off of bias vs variance for Generalized Advantage Estimator

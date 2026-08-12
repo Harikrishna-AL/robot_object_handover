@@ -1,6 +1,7 @@
 import gymnasium as gym
 
 from .bimanual_direct_env_cfg import BimanualDirectCfg
+from .bimanual_bidirectional_env_cfg import BimanualBidirectionalCfg
 from . import agents
 
 
@@ -16,5 +17,18 @@ gym.register(
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
         "skrl_sac_cfg_entry_point": f"{agents.__name__}:skrl_sac_cfg.yaml",
         "skrl_ddpg_cfg_entry_point": f"{agents.__name__}:skrl_ddpg_cfg.yaml"
+    }
+)
+
+# Round-trip handover: GEN3 grasps the object from UR5e, then UR5e grasps it
+# back from GEN3, both driven by one weight-shared policy. See
+# bimanual_bidirectional_env.py's module docstring for the design.
+gym.register(
+    id="Isaac-Bimanual-Bidirectional-v0",
+    entry_point="omni.isaac.lab_tasks.manager_based.classic.aurova_reinforcement_learning.bimanual_handover.bimanual_bidirectional_env:BimanualBidirectional",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": BimanualBidirectionalCfg,
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_ppo_cfg_bidirectional.yaml",
     }
 )

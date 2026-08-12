@@ -190,8 +190,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             clip_reward=np.inf,
         )
 
+    # Resolve the policy class from the yaml's `policy:` string (e.g.
+    # 'CustomActorCriticPolicy' or 'SharedArmActorCriticPolicy', both defined
+    # in networks.py and already in scope via `from networks import *`)
+    # instead of hardcoding a single class -- lets sb3_ppo_cfg_bidirectional.yaml
+    # select SharedArmActorCriticPolicy without a second copy of this script.
+    policy_cls = globals().get(policy_arch, CustomActorCriticPolicy)
+
     # create agent from stable baselines
-    agent = PPO(policy = CustomActorCriticPolicy, env = env, verbose=1, **agent_cfg)
+    agent = PPO(policy = policy_cls, env = env, verbose=1, **agent_cfg)
 
     # configure the logger
     new_logger = configure(log_dir, ["stdout", "tensorboard"])
