@@ -34,8 +34,8 @@ block laid out as
   + object/grasp-point pose rel. own base (7)
   + own selected hand-joint state (3)
   + other arm's ee pose rel. own base (7)
-  + role one-hot [is_holder, is_receiver] (2)
-= 26 (BimanualBidirectionalCfg.arm_obs_dim). The action is
+  + signed role scalar (+1 receiving / -1 giving) (1)
+= 25 (BimanualBidirectionalCfg.arm_obs_dim). The action is
 [UR5e action (9) | GEN3 action (9)], same per-arm meaning as BimanualDirect's
 single 9-dim action. If either layout changes, update
 BimanualBidirectionalCfg.arm_obs_dim/role_obs_dim and
@@ -44,11 +44,13 @@ sb3_ppo_cfg_bidirectional.yaml's policy_kwargs together.
 
 NUM_FINGER = len(FINGER_LINKS)
 THUMB_SLICE = slice(NUM_FINGER - 5, NUM_FINGER)  # finger_4 (2 links) + thumb (3 links), mirrors BimanualDirect's `-8:-3` slice into its 18-wide global array
+NON_THUMB_FINGER_GROUPS = [slice(0, 3), slice(3, 6), slice(6, 9), slice(9, 11)]  # finger_1, finger_2, finger_3, finger_4 -- each its own group of sub-link sensors, for the multi-finger grasp check below
 NUM_GLOBAL_CONTACTS = 2  # ur5e_w_ground, gen3_w_ground
 
 REWARD_TERM_KEYS = {
     "approach", "target", "bonus", "signal_1_firmness", "signal_2_balance",
     "signal_instability", "velocity_penalty", "force_excess",
+    "holder_still_penalty",
 }
 
 
@@ -70,8 +72,42 @@ class BimanualBidirectional(BimanualDirect):
         # Phase-1 mirrors of the parent's obj_reached / prev_dist bookkeeping.
         self.ur5e_grasped = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.round_trip_complete = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        # Consecutive-step counters gating grasp detection -- diagnosed
+        # 2026-08-14: contacts_flag (see _phase_reward) fires True from a
+        # single-frame incidental touch (self.contacts is boolean any-force,
+        # and the boolean-count threshold only needs one non-thumb link plus
+        # the thumb touching for one instant). Since new_receiver_grasped is
+        # a one-way latch for the rest of the episode, one spurious brush
+        # during approach permanently released both the object weld and the
+        # holder's real finger grip, leaving the near-massless (0.00025kg)
+        # object to drift under residual velocity/gravity with nothing
+        # holding it -- visible in rendered video as the object floating and
+        # sliding with no corresponding arm motion. Requiring the flag to
+        # hold for grasp_sustain_steps consecutive steps (see cfg) before
+        # latching filters out single-frame spikes.
+        self.gen3_contact_streak = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.ur5e_contact_streak = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.prev_dist_ur5e = torch.full((self.num_envs,), torch.inf, device=self.device)
         self.prev_dist_target_ur5e = torch.full((self.num_envs,), torch.inf, device=self.device)
+
+        # --- ALOHA-style staged single transfer (2026-08-15) ---------------
+        # See _get_rewards' docstring. self.stage is a per-env one-way ratchet
+        # 0..4 replacing the old two-phase round trip as the task definition.
+        self.stage = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.present_streak = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.receiver_grasp_streak = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.release_streak = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.transfer_complete = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # Handoff point: recomputed per episode in _reset_idx as the midpoint
+        # between the two arms' end effectors, so it adapts to UR5e's
+        # randomized start rather than being a hardcoded world coordinate.
+        self.handoff_pos = torch.zeros((self.num_envs, 3), device=self.device)
+        # inf means "no previous measurement yet" -- the potential-based
+        # shaping terms in _get_rewards skip the first step of each episode
+        # rather than reading inf as an enormous improvement.
+        self.prev_present_dist = torch.full((self.num_envs,), torch.inf, device=self.device)
+        self.prev_reach_dist = torch.full((self.num_envs,), torch.inf, device=self.device)
 
         # Per-arm pose bookkeeping filled in by update_new_poses(); replaces
         # the parent's GEN3-only singular tensors of the same name/purpose.
@@ -168,10 +204,120 @@ class BimanualBidirectional(BimanualDirect):
         actions_ur5e = self._preprocess_actions(actions[:, :9])
         actions_gen3 = self._preprocess_actions(actions[:, 9:])
 
+        self._gate_arm_motion(actions_ur5e, actions_gen3)
+
         self.perform_increment(idx=self.cfg.UR5e, actions=actions_ur5e)
         self.perform_increment(idx=self.cfg.GEN3, actions=actions_gen3)
 
         self._apply_releases()
+        self._weld_object_to_current_holder()
+
+    @staticmethod
+    def _freeze_pose_increment(actions_quat: torch.Tensor, mask: torch.Tensor):
+        '''
+        Neutralize the per-step Cartesian increment for the masked envs:
+        zero translation and identity rotation, so perform_increment leaves
+        the IK target exactly where it was. Columns 7: (the 16 hand joints)
+        are deliberately left untouched -- a waiting arm is still allowed to
+        pre-shape/open its hand, it just may not travel.
+        '''
+        if not torch.any(mask):
+            return
+        actions_quat[mask, 0:3] = 0.0
+        actions_quat[mask, 3] = 1.0
+        actions_quat[mask, 4:7] = 0.0
+
+    def _gate_arm_motion(self, actions_ur5e: torch.Tensor, actions_gen3: torch.Tensor):
+        '''
+        ALOHA-style temporal separation of the two arms (2026-08-15, at the
+        user's request after reviewing lerobot/act_aloha_sim_transfer_cube_human).
+        In that task the two arms never negotiate simultaneously: the first arm
+        picks the cube and brings it to a fixed meet pose, and only then does
+        the second arm move in to take it. Ours previously had both arms free
+        to move from step 0, which meant the "handoff pose" was a moving target
+        the receiver could never converge on -- consistent with Run A's receiver
+        closing to 0.317m and then plateauing there for the rest of training.
+
+        Stage 0 (holder still presenting): the receiver's arm is frozen.
+        Stage >=1 (object is at the handoff point): the HOLDER's arm freezes,
+        for the rest of the episode. In ALOHA the presenting arm parks at the
+        meet pose and simply waits; the receiver approaches a stationary
+        target. Its hand joints stay free so it can still open to release.
+
+        Freezing the holder at stage >=1 rather than >=3 also removes a
+        perverse incentive found in smoke job 3908485: holder_still_penalty
+        applies during stages 1-2, the ladder never ratchets backwards, and
+        stage 2->3 rarely fires -- so an env that reached stage 1 paid that
+        penalty for the whole remaining episode (measured 0.988/step, ~-395
+        per episode, against a total ladder value of 375). The cheapest
+        available policy was therefore to NEVER present the object and sit in
+        stage 0 forever. With the holder frozen the penalty is ~0 by
+        construction and cannot be dodged by refusing to progress.
+        '''
+        if not self.cfg.stage_gate_arms:
+            return
+        self._freeze_pose_increment(actions_gen3, self.stage == 0)
+        self._freeze_pose_increment(actions_ur5e, self.stage >= 1)
+
+    def _weld_object_to_current_holder(self):
+        '''
+        Object is never a free-falling projectile and never fully released
+        to raw physics mid-episode: it stays rigidly attached (kinematically
+        re-pinned each step, same reset-time hand-relative offset) to
+        whichever hand currently "has" it per the grasp state machine --
+        the phase's holder before its receiver has grasped, the receiver
+        itself afterward. Both arms are the same physical hand geometry, so
+        the same offset is valid for either.
+
+        Diagnosed 2026-08-14 in two stages: (1) originally the object was
+        only positioned once at reset with no ongoing support, so it
+        free-fell under gravity from step 0 and hit object_height_limit
+        (failure) in ~27 steps before any grasp had ever occurred
+        (metrics/contact_forces was 0.0 across every step of every rollout
+        inspected) -- fixed by welding to the holder pre-grasp. (2) that
+        first fix released the weld entirely to free physics once
+        new_receiver_grasped latched, but that latch is a ONE-WAY switch for
+        the rest of the episode, and grasp-detection -- even after adding a
+        real force-magnitude threshold, a >=2-distinct-finger-groups
+        requirement, and a multi-step sustain counter -- can still fire once
+        from a brief incidental sweep-through during fast exploratory
+        motion. A single such event permanently left the near-massless
+        (0.00025kg) object with nothing physically holding it for the rest
+        of the episode, which is what produced the "floating and drifting
+        independent of visible arm motion" behaviour seen in rendered video.
+        Continuing to weld to the receiver post-grasp (instead of releasing)
+        makes a still-imperfect detection harmless -- the object just
+        kinematically follows the "wrong" hand -- rather than catastrophic.
+        '''
+        # Single-transfer staging (2026-08-15): UR5e holds until the receiver
+        # has a sustained grasp (stage >= 3), GEN3 holds from then on.
+        gen3_is_holder = self.stage >= 3
+
+        for idx, holder_mask in (
+            (self.cfg.UR5e, torch.logical_not(gen3_is_holder)),
+            (self.cfg.GEN3, gen3_is_holder),
+        ):
+            if not torch.any(holder_mask):
+                continue
+            env_ids = holder_mask.nonzero(as_tuple=False).squeeze(-1)
+            key = self.cfg.keys[idx]
+            ee_pose_w = self.scene.articulations[key].data.body_state_w[env_ids, self.ee_jacobi_idx[idx] + 1, 0:7]
+            obj_pos, obj_quat = combine_frame_transforms(
+                t01=ee_pose_w[:, :3], q01=ee_pose_w[:, 3:],
+                t12=self.cfg.obj_pos_trans[env_ids], q12=self.cfg.obj_quat_trans[env_ids],
+            )
+            self.scene.rigid_objects["object"].write_root_pose_to_sim(
+                root_pose=torch.cat((obj_pos, obj_quat), dim=-1), env_ids=env_ids
+            )
+            # Diagnosed 2026-08-15: write_root_velocity_to_sim (zeroing
+            # velocity every step) was PROVEN via isolation testing to break
+            # the render pipeline's ability to visually update the rest of
+            # the scene after the first frame -- the arms kept moving
+            # correctly in the physics simulation (verified via joint_pos
+            # telemetry the whole time) but appeared visually frozen in every
+            # rendered video all session. write_root_pose_to_sim alone does
+            # not have this effect. The object's velocity is never read by
+            # any reward/observation code, so dropping this call is free.
 
     def _apply_releases(self):
         '''
@@ -182,11 +328,8 @@ class BimanualBidirectional(BimanualDirect):
         last 16 columns of self.actions[idx] regardless of arm DOF (6 for
         UR5e, 7 for GEN3), so -16: is used rather than a fixed offset.
         '''
-        phase0_release = torch.logical_and(self.phase == 0, self.obj_reached)
-        self.actions[self.cfg.UR5e][phase0_release, -16:] = self.open_hand_joints
-
-        phase1_release = torch.logical_and(self.phase == 1, self.ur5e_grasped)
-        self.actions[self.cfg.GEN3][phase1_release, -16:] = self.open_hand_joints
+        release = self.stage >= 3
+        self.actions[self.cfg.UR5e][release, -16:] = self.open_hand_joints
 
     def _apply_action(self) -> None:
         self.scene.articulations[self.cfg.keys[self.cfg.UR5e]].set_joint_position_target(
@@ -265,8 +408,15 @@ class BimanualBidirectional(BimanualDirect):
         self.filter_collisions()
         self.update_new_poses()
 
-        role_ur5e = torch.stack(((self.phase == 0).float(), (self.phase == 1).float()), dim=-1)
-        role_gen3 = torch.stack(((self.phase == 1).float(), (self.phase == 0).float()), dim=-1)
+        # Signed context scalar (+1 receiving, -1 giving/holding) per user
+        # direction after a supervisor discussion, 2026-08-13 -- replaces the
+        # earlier 2-dim one-hot [is_holder, is_receiver]. Under the staged
+        # single transfer (2026-08-15) GEN3 is the receiver until it has the
+        # object (stage >= 3), after which the roles flip -- so the scalar is
+        # still the thing that tells the shared policy which arm it is driving.
+        gen3_has_object = (self.stage >= 3).float()
+        role_ur5e = (2.0 * gen3_has_object - 1.0).unsqueeze(-1)
+        role_gen3 = (1.0 - 2.0 * gen3_has_object).unsqueeze(-1)
 
         ur5e_block = torch.cat((
             self.rot_ee_pose_r[self.cfg.UR5e],
@@ -292,6 +442,7 @@ class BimanualBidirectional(BimanualDirect):
         self, receiver_idx, holder_idx, contacts_local, force_norms_local,
         prev_contacts_local, prev_force_norms_local, arm_contact_matrix,
         target_pose, prev_dist, prev_dist_target, receiver_grasped,
+        contact_streak,
     ):
         '''
         Reusable grasp-approach-then-transport reward, parameterized by which
@@ -303,7 +454,7 @@ class BimanualBidirectional(BimanualDirect):
         remapping was derived.
 
         Returns (reward, hand_obj_dist, obj_target_dist, new_receiver_grasped,
-        just_transitioned, reached_target, log).
+        just_transitioned, reached_target, log, new_streak).
         '''
         cfg = self.cfg
         device = self.device
@@ -338,9 +489,29 @@ class BimanualBidirectional(BimanualDirect):
         else:
             contacts_flag = torch.logical_and(contacts_w[:, :-1].sum(-1) - thumb_w.sum(-1) > 0.4, thumb_con)
 
-        just_transitioned = torch.logical_and(contacts_flag, torch.logical_not(receiver_grasped))
+        # Multi-finger requirement -- diagnosed 2026-08-14: the threshold
+        # check above sums ALL of finger_1/2/3's own sub-link sensors
+        # together (FINGER_LINKS packs 2-3 contact-sensor links per physical
+        # finger), so a SINGLE finger resting/pressing against the object
+        # with its own multiple sub-links active can clear the threshold
+        # alone (one fingertip alone is weight 0.65 > 0.4). That let
+        # obj_reached/ur5e_grasped latch permanently from one finger's
+        # sustained contact, not a real multi-finger grasp -- releasing both
+        # the kinematic weld and the holder's real grip with nothing left to
+        # mechanically support the object. Require at least 2 of the 4
+        # non-thumb finger groups (not sub-links) plus the thumb.
+        finger_group_touch = torch.stack(
+            [(contacts_w[:, g] > 0.0).any(dim=-1) for g in NON_THUMB_FINGER_GROUPS], dim=-1
+        )
+        multi_finger_grasp = torch.logical_and(finger_group_touch.float().sum(-1) >= 2, thumb_con)
+        contacts_flag = torch.logical_and(contacts_flag, multi_finger_grasp)
+
+        new_streak = torch.where(contacts_flag, contact_streak + 1, torch.zeros_like(contact_streak))
+        sustained_flag = new_streak >= cfg.grasp_sustain_steps
+
+        just_transitioned = torch.logical_and(sustained_flag, torch.logical_not(receiver_grasped))
         bonus = receiver_grasped.clone()
-        new_receiver_grasped = torch.logical_or(contacts_flag, receiver_grasped)
+        new_receiver_grasped = torch.logical_or(sustained_flag, receiver_grasped)
         bonus = torch.logical_and(new_receiver_grasped.clone(), torch.logical_not(bonus))
 
         # Generalized "object arrived at target" check: original task used an
@@ -351,17 +522,28 @@ class BimanualBidirectional(BimanualDirect):
         # oriented approach, so both phases use this symmetric form instead.
         reached_target = obj_target_dist[:, 1] < cfg.obj_reach_target_thresh
 
-        dist = hand_obj_dist[:, 0] * torch.logical_not(new_receiver_grasped).int() + obj_target_dist[:, 0] * new_receiver_grasped.int()
+        # RUN-A CHANGE 2026-08-15: shape approach/transport on the TRANSLATION
+        # module (index 1, metres) instead of the dual-quaternion module
+        # (index 0, which blends position AND rotation).
+        # Measured on job 3905946's checkpoint: the receiver's fingertips went
+        # 0.4464m -> 0.4734m over 300 steps (moved AWAY, never below 0.435m)
+        # while the logged dual-quat "hand_obj_dist" fell to 0.379 and the
+        # sparkline trended down -- i.e. the shaped quantity improved while
+        # actual Euclidean approach did not. A rotation-blended metric can be
+        # minimised by spinning the wrist, and arm_joint_7 (wrist roll) has
+        # shown the largest travel of any joint in every run. Index 1 is
+        # metres, so "closer" can only mean closer.
+        dist = hand_obj_dist[:, 1] * torch.logical_not(new_receiver_grasped).int() + obj_target_dist[:, 1] * new_receiver_grasped.int()
         prev_dist_eff = prev_dist * torch.logical_not(new_receiver_grasped).int() + prev_dist_target * new_receiver_grasped.int()
 
-        pre_mod = torch.logical_and(tips_dist > obj_dist, hand_obj_dist_back[:, 0] > hand_obj_dist[:, 0])
-        mod = 2 * (torch.logical_and(dist < prev_dist_eff, pre_mod)) - 1
+        pre_mod = torch.logical_and(tips_dist > obj_dist, hand_obj_dist_back[:, 1] > hand_obj_dist[:, 1])
+        mod = torch.logical_and(dist < prev_dist_eff, pre_mod).float()
 
         rew_scale_hand_obj = cfg.rew_scale_hand_obj * torch.ones(self.num_envs, device=device)
         rew_scale_hand_obj = rew_scale_hand_obj / (contacts_local[:, :-1].sum(-1) + 1)
 
-        reward_1 = mod * rew_scale_hand_obj * torch.exp(-2 * hand_obj_dist[:, 0]) / (1 + 2 * (torch.logical_not(pre_mod)).int())
-        reward_2 = cfg.rew_scale_obj_target * torch.exp(-2 * obj_target_dist[:, 0])
+        reward_1 = mod * rew_scale_hand_obj * torch.exp(-2 * hand_obj_dist[:, 1]) / (1 + 2 * (torch.logical_not(pre_mod)).int())
+        reward_2 = cfg.rew_scale_obj_target * torch.exp(-2 * obj_target_dist[:, 1])
 
         reward = reward_1 * torch.logical_not(new_receiver_grasped) + 10 * reward_2 * new_receiver_grasped + cfg.bonus_obj_reach * bonus / 2
         reward = reward + contacts_w[:, :-1].sum(-1)
@@ -405,9 +587,27 @@ class BimanualBidirectional(BimanualDirect):
         )
         if cfg.vel_rew:
             excess_vel = torch.nn.functional.relu(ee_vel_norm - cfg.v_min)
-            velocity_penalty = cfg.lambda_vel * (excess_vel**2) * torch.exp(-cfg.k_decay * hand_obj_dist[:, 0]) * torch.logical_not(new_receiver_grasped).float()
+            velocity_penalty = cfg.lambda_vel * (excess_vel**2) * torch.exp(-cfg.k_decay * hand_obj_dist[:, 1]) * torch.logical_not(new_receiver_grasped).float()
             reward = reward - velocity_penalty
             log["velocity_penalty"] = velocity_penalty
+
+        # Holder stability: while the receiver is still closing in, the arm
+        # currently holding the object should keep it as still as possible.
+        # Gated by exp(-k_decay*hand_obj_dist) so it only bites during the
+        # final approach, and switched off once the receiver has grasped
+        # (after which the holder must move to release).
+        holder_ee_vel = self.scene.articulations[cfg.keys[holder_idx]].data.body_state_w[
+            :, self.ee_jacobi_idx[holder_idx] + 1, 7:
+        ]
+        holder_speed = torch.norm(holder_ee_vel, dim=-1)
+        holder_still_penalty = (
+            cfg.lambda_holder_still
+            * holder_speed
+            * torch.exp(-cfg.k_decay * hand_obj_dist[:, 1])
+            * torch.logical_not(new_receiver_grasped).float()
+        )
+        reward = reward - holder_still_penalty
+        log["holder_still_penalty"] = holder_still_penalty
 
         if cfg.use_force_rewards:
             excess_force = torch.relu(force_norms_local[:, :-1] - cfg.F_safe)
@@ -415,8 +615,8 @@ class BimanualBidirectional(BimanualDirect):
             reward = reward + r_excess
             log["force_excess"] = r_excess
 
-        log["hand_obj_dist"] = hand_obj_dist[:, 0]
-        log["obj_target_dist"] = obj_target_dist[:, 0]
+        log["hand_obj_dist"] = hand_obj_dist[:, 1]        # metres (was dual-quat)
+        log["obj_target_dist"] = obj_target_dist[:, 1]      # metres (was dual-quat)
         log["ee_vel_norm"] = ee_vel_norm
         log["contact_forces"] = contacts_w.sum(-1)
         log["force_at_transition"] = (
@@ -424,7 +624,7 @@ class BimanualBidirectional(BimanualDirect):
         )
         log["velocity_at_transition"] = ee_vel_norm[just_transitioned].mean().item() if just_transitioned.any() else 0.0
 
-        return reward, hand_obj_dist[:, 0], obj_target_dist[:, 0], new_receiver_grasped, just_transitioned, reached_target, log
+        return reward, hand_obj_dist[:, 1], obj_target_dist[:, 1], new_receiver_grasped, just_transitioned, reached_target, log, new_streak
 
     def _log_phase(self, log: dict, suffix: str):
         if "log" not in self.extras:
@@ -434,7 +634,254 @@ class BimanualBidirectional(BimanualDirect):
             prefix = "reward_terms" if key in REWARD_TERM_KEYS else "metrics"
             self.extras["log"][f"{prefix}/{key}{suffix}"] = val
 
+    def _grasp_flags(self, idx: int, arm_contact_matrix: torch.Tensor):
+        '''
+        (touch, grasp) for one arm. `touch` is any object contact on the hand;
+        `grasp` is the hardened multi-finger criterion carried over from
+        _phase_reward -- force above F_threshold, thumb engaged, and at least 2
+        of the 4 non-thumb finger GROUPS (not sub-links) in contact. See
+        _phase_reward's comments for why the group requirement exists.
+        '''
+        cfg = self.cfg
+        sl = self._gen3_contact_slice if idx == cfg.GEN3 else self._ur5e_contact_slice
+        contacts_w = self.contacts[:, sl] * arm_contact_matrix
+        thumb_w = contacts_w[:, THUMB_SLICE]
+        thumb_con = thumb_w.sum(-1) > 0.0
+        touch = contacts_w[:, :-1].sum(-1) > 0.0
+
+        if cfg.use_force_rewards and cfg.F_threshold > 0:
+            force_w = torch.tanh(self.force_norms[:, sl] / cfg.F_ref) * arm_contact_matrix
+            firm = torch.logical_and(
+                force_w[:, :-1].sum(-1) - force_w[:, THUMB_SLICE].sum(-1) > cfg.F_threshold,
+                force_w[:, THUMB_SLICE].sum(-1) > 0.0,
+            )
+        else:
+            firm = torch.logical_and(contacts_w[:, :-1].sum(-1) - thumb_w.sum(-1) > 0.4, thumb_con)
+
+        groups = torch.stack([(contacts_w[:, g] > 0.0).any(dim=-1) for g in NON_THUMB_FINGER_GROUPS], dim=-1)
+        grasp = firm & (groups.float().sum(-1) >= 2) & thumb_con
+        return touch, grasp
+
+    def _force_signal_rewards(self, receiver_idx: int, holder_idx: int, arm_contact_matrix: torch.Tensor):
+        '''
+        The force-based reward signals (the project's own contribution, from
+        the feature/force-reward-signals work) carried over unchanged from
+        _phase_reward into the staged task. Term-for-term identical formulas;
+        only the gating condition is re-expressed, since `new_receiver_grasped`
+        no longer exists -- its equivalent is `stage >= 3` (receiver has a
+        sustained multi-finger grasp).
+
+          signal_1  grasp firmness   -- summed normalized contact force
+          signal_2  thumb/finger force balance
+          signal_instability  contact-pattern churn x force drop-off
+          force_excess  safety penalty above F_safe
+
+        force_excess is applied to BOTH hands here, where the baseline applied
+        it only to the receiver. Under the staged task the holder is gripping
+        for most of the episode, so a receiver-only penalty would let the
+        holder crush the object for free.
+        '''
+        cfg = self.cfg
+        stage = self.stage
+        grasping = (stage >= 3).float()
+        reward = torch.zeros(self.num_envs, device=self.device)
+        log: dict = {}
+
+        sl_r = self._gen3_contact_slice if receiver_idx == cfg.GEN3 else self._ur5e_contact_slice
+        contacts_local = self.contacts[:, sl_r]
+        force_local = self.force_norms[:, sl_r]
+        force_w = torch.tanh(force_local / cfg.F_ref) * arm_contact_matrix
+
+        if cfg.use_signal_1:
+            # Only paid once the receiver is actually in contact, otherwise it
+            # is identically zero anyway.
+            signal_1_value = force_w[:, :-1].sum(-1)
+            reward = reward + signal_1_value
+            log["signal_1_firmness"] = signal_1_value
+
+        if cfg.use_signal_2:
+            thumb_force = force_w[:, THUMB_SLICE].sum(-1)
+            finger_force = force_w[:, 0 : NUM_FINGER - 5].sum(-1) + cfg.palm_weight * force_w[:, NUM_FINGER : NUM_FINGER + 1].sum(-1)
+            balance_imbalance = torch.abs(thumb_force - finger_force) / (thumb_force + finger_force + 1e-6)
+            total_grasp_force = force_w[:, 0:NUM_FINGER].sum(-1)
+            balance_active = (total_grasp_force > cfg.F_threshold).float()
+            r_balance = -cfg.lambda_balance * balance_imbalance * grasping * balance_active
+            reward = reward + r_balance
+            log["signal_2_balance"] = r_balance
+
+        if cfg.use_signal_instability:
+            pattern_change = (contacts_local[:, :-1].float() - self.prev_contacts[:, sl_r][:, :-1]).abs().sum(-1)
+            current_total = force_local[:, :-1].sum(-1)
+            prev_total = self.prev_force_norms[:, sl_r][:, :-1].sum(-1)
+            force_drop = torch.relu(prev_total - current_total)
+            r_instability = -cfg.lambda_instability * pattern_change * force_drop * grasping
+            reward = reward + r_instability
+            log["signal_instability"] = r_instability
+
+        if cfg.use_force_rewards:
+            r_excess = torch.zeros(self.num_envs, device=self.device)
+            for idx in (receiver_idx, holder_idx):
+                sl = self._gen3_contact_slice if idx == cfg.GEN3 else self._ur5e_contact_slice
+                r_excess = r_excess - cfg.lambda_force_excess * torch.relu(self.force_norms[:, sl][:, :-1] - cfg.F_safe).sum(-1)
+            reward = reward + r_excess
+            log["force_excess"] = r_excess
+
+        return reward, log
+
     def _get_rewards(self) -> torch.Tensor:
+        '''
+        ALOHA-style staged single transfer (2026-08-15), replacing the
+        continuous two-phase round-trip reward.
+
+        Modelled on lerobot/act_aloha_sim_transfer_cube_human's task, which the
+        user asked to take the setup from. That benchmark scores a 0-4 sparse
+        ladder (touch / lift / other-gripper-touch / transferred) and calls
+        success a SINGLE transfer, with the two arms acting in sequence rather
+        than simultaneously. Ours:
+
+          stage 0  holder (UR5e) brings the object to the handoff point
+          stage 1  presented and held steady -> receiver (GEN3) is released to move
+          stage 2  receiver's hand is touching the object
+          stage 3  receiver has a sustained multi-finger grasp; holder opens
+          stage 4  receiver still holds it after the holder let go  == SUCCESS
+
+        The ladder is a one-way ratchet, so an env can never lose progress it
+        has already banked. Between rungs the only dense signal is
+        potential-based (prev_dist - dist) on whichever arm is currently
+        active. That replaces Run A's `mod` gate, which paid approach reward
+        ONLY on strictly-improving steps and is the leading suspect for the
+        0.317m plateau: once the receiver stopped improving, its reward went to
+        zero everywhere nearby and the gradient vanished. Potential-based
+        shaping is dense, is symmetric (backing off costs exactly what
+        approaching pays), and is the standard policy-invariant form.
+
+        Also gone: the old `reward + contacts_w.sum(-1)` free-contact term,
+        which paid for merely touching anything and accounted for most of Run
+        A's flat ~79 ep_rew_mean without any task progress behind it.
+        '''
+        cfg = self.cfg
+        # NOTE: prev_force_norms/prev_contacts are refreshed at the END of this
+        # method, not the start. Diagnosed 2026-08-15: the baseline does the
+        # clone on the first two lines of its _get_rewards
+        # (bimanual_direct_env.py:580) and then reads self.prev_contacts at
+        # line 705 to compute `pattern_change` -- by which point prev has
+        # already been overwritten with the current values, so pattern_change
+        # and force_drop are IDENTICALLY ZERO and signal_instability has never
+        # contributed anything in any run, in this env or the baseline.
+        arm_contact_matrix = self.cfg.contact_matrix[self._ur5e_contact_slice]  # identical to the gen3 segment by construction
+        holder_idx, receiver_idx = cfg.UR5e, cfg.GEN3
+
+        obj = self.scene.rigid_objects["object"].data.body_state_w[:, 0, :3]
+        tips_receiver = self.scene.articulations[cfg.keys[receiver_idx]].data.body_state_w[
+            :, self.finger_tips[receiver_idx], 0:7
+        ].mean(1)[:, :3]
+
+        # Both in metres, Euclidean. Deliberately NOT dual_quaternion_error:
+        # index 0 of that blends position and rotation and was minimisable by
+        # spinning the wrist (diagnosed 2026-08-15, see _phase_reward).
+        present_dist = torch.norm(obj - self.handoff_pos, dim=-1)
+        reach_dist = torch.norm(tips_receiver - obj, dim=-1)
+
+        touch_receiver, grasp_receiver = self._grasp_flags(receiver_idx, arm_contact_matrix)
+        stage = self.stage
+
+        # ---- stage transitions (one-way ratchet) -------------------------
+        self.present_streak = torch.where(
+            present_dist < cfg.handoff_thresh, self.present_streak + 1, torch.zeros_like(self.present_streak)
+        )
+        self.receiver_grasp_streak = torch.where(
+            grasp_receiver, self.receiver_grasp_streak + 1, torch.zeros_like(self.receiver_grasp_streak)
+        )
+        # Only counts once the holder has actually let go (stage >= 3), which
+        # is what makes stage 4 a real transfer rather than a double grip.
+        self.release_streak = torch.where(
+            torch.logical_and(stage >= 3, grasp_receiver), self.release_streak + 1, torch.zeros_like(self.release_streak)
+        )
+
+        to1 = torch.logical_and(stage == 0, self.present_streak >= cfg.present_sustain_steps)
+        to2 = torch.logical_and(stage == 1, touch_receiver)
+        to3 = torch.logical_and(stage == 2, self.receiver_grasp_streak >= cfg.grasp_sustain_steps)
+        to4 = torch.logical_and(stage == 3, self.release_streak >= cfg.release_sustain_steps)
+
+        new_stage = stage.clone()
+        for flag, value in ((to1, 1), (to2, 2), (to3, 3), (to4, 4)):
+            new_stage = torch.where(flag, torch.full_like(stage, value), new_stage)
+        self.stage = new_stage
+
+        # ---- dense potential-based shaping, active arm only --------------
+        # inf on the first step of an episode means "no baseline yet" -- pay 0
+        # rather than treating inf-finite as an infinite improvement.
+        holder_active = stage == 0
+        receiver_active = torch.logical_and(stage >= 1, stage <= 2)
+        d_present = torch.where(
+            torch.isfinite(self.prev_present_dist), self.prev_present_dist - present_dist, torch.zeros_like(present_dist)
+        ).clamp(-cfg.shaping_clip, cfg.shaping_clip)
+        d_reach = torch.where(
+            torch.isfinite(self.prev_reach_dist), self.prev_reach_dist - reach_dist, torch.zeros_like(reach_dist)
+        ).clamp(-cfg.shaping_clip, cfg.shaping_clip)
+
+        reward = cfg.w_present * d_present * holder_active.float() + cfg.w_reach * d_reach * receiver_active.float()
+
+        self.prev_present_dist = present_dist
+        self.prev_reach_dist = reach_dist
+
+        # ---- sparse ladder bonuses, paid once on entry -------------------
+        reward = (
+            reward
+            + cfg.bonus_present * to1.float()
+            + cfg.bonus_touch * to2.float()
+            + cfg.bonus_grasp * to3.float()
+            + cfg.bonus_transfer * to4.float()
+        )
+
+        # ---- penalties ---------------------------------------------------
+        # Holder must present a stable target while the receiver closes in.
+        holder_speed = torch.norm(
+            self.scene.articulations[cfg.keys[holder_idx]].data.body_state_w[:, self.ee_jacobi_idx[holder_idx] + 1, 7:], dim=-1
+        )
+        holder_still_penalty = cfg.lambda_holder_still * holder_speed * receiver_active.float()
+        reward = reward - holder_still_penalty
+
+        arm_arm_contact = (self.contacts[:, -1] > 0.0).float()
+        reward = reward - cfg.lambda_arm_collision * arm_arm_contact
+
+        # ---- force reward signals (carried over from the baseline) --------
+        force_reward, force_log = self._force_signal_rewards(receiver_idx, holder_idx, arm_contact_matrix)
+        reward = reward + force_reward
+
+        self.transfer_complete = self.stage >= 4
+        # Kept in sync so inherited BimanualDirect code and the weld/release
+        # helpers agree on who is holding the object.
+        self.obj_reached = self.stage >= 3
+        self.round_trip_complete = self.transfer_complete
+
+        log = self.extras.setdefault("log", {})
+        log["metrics/stage_mean"] = self.stage.float().mean().item()
+        for k in range(1, 5):
+            log[f"metrics/stage{k}_fraction"] = (self.stage >= k).float().mean().item()
+        log["metrics/present_dist"] = present_dist.mean().item()
+        log["metrics/hand_obj_dist"] = reach_dist.mean().item()
+        log["metrics/arm_arm_collision"] = arm_arm_contact.mean().item()
+        log["metrics/success_rate"] = self.transfer_complete.float().mean().item()
+        log["reward_terms/shaping_present"] = (cfg.w_present * d_present * holder_active.float()).mean().item()
+        log["reward_terms/shaping_reach"] = (cfg.w_reach * d_reach * receiver_active.float()).mean().item()
+        log["reward_terms/holder_still_penalty"] = holder_still_penalty.mean().item()
+        for key, value in force_log.items():
+            log[f"reward_terms/{key}"] = value.mean().item() if torch.is_tensor(value) else value
+
+        # Refresh AFTER every read of the previous step's values -- see the
+        # ordering note at the top of this method.
+        self.prev_force_norms = self.force_norms.clone()
+        self.prev_contacts = self.contacts.clone().float()
+
+        return reward
+
+    def _get_rewards_round_trip_legacy(self) -> torch.Tensor:
+        '''
+        The pre-2026-08-15 two-phase round-trip reward, kept for reference and
+        for the eventual curriculum step back up to a full round trip. Not
+        called. success_rate was 0 in every run this ever drove.
+        '''
         self.prev_force_norms = self.force_norms.clone()
         self.prev_contacts = self.contacts.clone().float()
 
@@ -443,7 +890,7 @@ class BimanualBidirectional(BimanualDirect):
         phase0 = self.phase == 0
         phase1 = self.phase == 1
 
-        reward0, hand_dist0, target_dist0, gen3_grasped_new, just_trans0, reached_target0, log0 = self._phase_reward(
+        reward0, hand_dist0, target_dist0, gen3_grasped_new, just_trans0, reached_target0, log0, gen3_streak_new = self._phase_reward(
             receiver_idx=self.cfg.GEN3, holder_idx=self.cfg.UR5e,
             contacts_local=self.contacts[:, self._gen3_contact_slice],
             force_norms_local=self.force_norms[:, self._gen3_contact_slice],
@@ -452,8 +899,9 @@ class BimanualBidirectional(BimanualDirect):
             arm_contact_matrix=arm_contact_matrix,
             target_pose=self.cfg.target_pose, prev_dist=self.prev_dist, prev_dist_target=self.prev_dist_target,
             receiver_grasped=self.obj_reached,
+            contact_streak=self.gen3_contact_streak,
         )
-        reward1, hand_dist1, target_dist1, ur5e_grasped_new, just_trans1, reached_target1, log1 = self._phase_reward(
+        reward1, hand_dist1, target_dist1, ur5e_grasped_new, just_trans1, reached_target1, log1, ur5e_streak_new = self._phase_reward(
             receiver_idx=self.cfg.UR5e, holder_idx=self.cfg.GEN3,
             contacts_local=self.contacts[:, self._ur5e_contact_slice],
             force_norms_local=self.force_norms[:, self._ur5e_contact_slice],
@@ -462,10 +910,13 @@ class BimanualBidirectional(BimanualDirect):
             arm_contact_matrix=arm_contact_matrix,
             target_pose=self.cfg.target_pose_ur5e, prev_dist=self.prev_dist_ur5e, prev_dist_target=self.prev_dist_target_ur5e,
             receiver_grasped=self.ur5e_grasped,
+            contact_streak=self.ur5e_contact_streak,
         )
 
         self.obj_reached = torch.where(phase0, gen3_grasped_new, self.obj_reached)
         self.ur5e_grasped = torch.where(phase1, ur5e_grasped_new, self.ur5e_grasped)
+        self.gen3_contact_streak = torch.where(phase0, gen3_streak_new, self.gen3_contact_streak)
+        self.ur5e_contact_streak = torch.where(phase1, ur5e_streak_new, self.ur5e_contact_streak)
         self.prev_dist = torch.where(phase0, hand_dist0, self.prev_dist)
         self.prev_dist_target = torch.where(phase0, target_dist0, self.prev_dist_target)
         self.prev_dist_ur5e = torch.where(phase1, hand_dist1, self.prev_dist_ur5e)
@@ -481,6 +932,15 @@ class BimanualBidirectional(BimanualDirect):
         advance = torch.logical_and(phase0, torch.logical_and(gen3_grasped_new, reached_target0))
         self.phase = torch.where(advance, torch.ones_like(self.phase), self.phase)
         reward = reward + self.cfg.bonus_obj_reach * advance.float()
+
+        # Arm-to-arm collision penalty. self.contacts' final column is the
+        # robot1_w_robot2 sensor (see update_collisions_bidirectional). It had
+        # weight 0 in contact_matrix and was absent from _get_dones, so the
+        # policy had no incentive whatsoever to avoid driving the two arms
+        # through each other -- which the 0.60m separation actively encouraged.
+        arm_arm_contact = (self.contacts[:, -1] > 0.0).float()
+        reward = reward - self.cfg.lambda_arm_collision * arm_arm_contact
+        self.extras.setdefault("log", {})["metrics/arm_arm_collision"] = arm_arm_contact.mean().item()
 
         self.round_trip_complete = torch.logical_and(phase1, torch.logical_and(ur5e_grasped_new, reached_target1))
 
@@ -507,11 +967,15 @@ class BimanualBidirectional(BimanualDirect):
         ground_contact = torch.logical_or(self.contacts[:, 0] > 0.0, self.contacts[:, 1] > 0.0)
 
         truncated = torch.logical_or(torch.logical_or(falling, out_of_bounds), ground_contact)
-        terminated = torch.logical_or(time_out, self.round_trip_complete)
+        # Success is now a SINGLE completed transfer (stage 4), matching the
+        # ALOHA transfer-cube benchmark's own success definition, rather than
+        # the round trip -- which was strictly harder than the published task
+        # and never fired once in any run.
+        terminated = torch.logical_or(time_out, self.transfer_complete)
 
-        success = self.round_trip_complete & ~truncated
-        indet = self.round_trip_complete & truncated
-        fail = ~self.round_trip_complete & (terminated | truncated)
+        success = self.transfer_complete & ~truncated
+        indet = self.transfer_complete & truncated
+        fail = ~self.transfer_complete & (terminated | truncated)
 
         if "log" not in self.extras:
             self.extras["log"] = dict()
@@ -533,6 +997,33 @@ class BimanualBidirectional(BimanualDirect):
 
         self.phase[env_ids] = 0
         self.ur5e_grasped[env_ids] = False
+        self.gen3_contact_streak[env_ids] = 0
+        self.ur5e_contact_streak[env_ids] = 0
         self.round_trip_complete[env_ids] = False
         self.prev_dist_ur5e[env_ids] = torch.inf
         self.prev_dist_target_ur5e[env_ids] = torch.inf
+
+        # --- staged single transfer ---------------------------------------
+        self.stage[env_ids] = 0
+        self.present_streak[env_ids] = 0
+        self.receiver_grasp_streak[env_ids] = 0
+        self.release_streak[env_ids] = 0
+        self.transfer_complete[env_ids] = False
+        self.prev_present_dist[env_ids] = torch.inf
+        self.prev_reach_dist[env_ids] = torch.inf
+
+        # Handoff point = midpoint between the two end effectors at reset,
+        # raised by cfg.handoff_height_offset. Computed per episode rather
+        # than hardcoded because UR5e's start pose is randomized, so a fixed
+        # world coordinate would sometimes be trivially close to the holder
+        # and sometimes outside its reach. Both arms are identical GEN3s at
+        # a fixed separation, so the midpoint is reachable by construction.
+        ee_holder = self.scene.articulations[self.cfg.keys[self.cfg.UR5e]].data.body_state_w[
+            env_ids, self.ee_jacobi_idx[self.cfg.UR5e] + 1, 0:3
+        ]
+        ee_receiver = self.scene.articulations[self.cfg.keys[self.cfg.GEN3]].data.body_state_w[
+            env_ids, self.ee_jacobi_idx[self.cfg.GEN3] + 1, 0:3
+        ]
+        handoff = 0.5 * (ee_holder + ee_receiver)
+        handoff[:, 2] = handoff[:, 2] + self.cfg.handoff_height_offset
+        self.handoff_pos[env_ids] = handoff

@@ -12,16 +12,19 @@ batch_size: 4096
 gae_lambda: 0.95
 gamma: 0.99
 n_epochs: 20
-ent_coef: 0.01
+ent_coef: !!float 0.0  # was 0.01 -- diagnosed 2026-08-14: std climbed to 2.1 and entropy_loss to 132 over a full 1250-iter run instead of shrinking, meaning the entropy bonus was outweighing the (small-magnitude) task reward and rewarding the policy for staying random. Same base yaml as the single-arm task (which converged fine at 0.01), so this is specific to the two-arm shared-policy setup.
 learning_rate: !!float 1e-4
 clip_range: !!float 0.2
-use_sde: True
+use_sde: False  # was True -- diagnosed 2026-08-14: networks.py's own comment flags SharedArmActorCriticPolicy+use_sde=True as never actually verified against a real SB3 install. After fixing the ent_coef runaway (std no longer exploding), reward was still completely flat and phase1_fraction stayed at exactly 0 for 325+ iterations -- the policy never even completed phase 0 once, despite the standalone single-arm direct-reach task (same core reward mechanics) learning that same skill successfully. SDE noise is state-dependent via a latent_sde pathway that SharedArmMlpExtractor never separately implements (it reuses latent_dim_pi), a plausible source of degenerate exploration through this custom architecture. Switching to standard iid Gaussian action noise, which does not depend on that wiring.
+# squash_output removed (2026-08-14): SB3 asserts squash_output=True is only
+# valid with use_sde=True, which we just turned off above. It's redundant
+# anyway -- SharedArmActionHead (networks.py) already applies its own Tanh()
+# to bound actions, independent of this SB3-level flag.
 policy_kwargs: "dict(
                   activation_fn=nn.Tanh,
                   net_arch=[256, 128, 64],
-                  squash_output=True,
                   share_features_extractor = True,
-                  arm_obs_dim=26,
+                  arm_obs_dim=25,
                   action_dim_per_arm=9,
                 )"
 vf_coef: 1.0

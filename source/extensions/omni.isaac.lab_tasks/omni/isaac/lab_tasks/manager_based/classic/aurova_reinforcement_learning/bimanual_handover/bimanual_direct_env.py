@@ -42,7 +42,7 @@ class BimanualDirect(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
         
         # Initial poses sampled in reset for both robots
-        self.reset_joint_positions = [torch.zeros((self.num_envs, 6+16)).to(self.device), torch.zeros((self.num_envs, 7+16)).to(self.device)]
+        self.reset_joint_positions = [torch.zeros((self.num_envs, len(self.cfg.all_joints[idx]))).to(self.device) for idx in range(len(self.cfg.keys))]
 
         # Debug poses for the object and end effector of the GEN3 robot. These poses 
         # are used to draw the markers in the simulation
@@ -885,10 +885,10 @@ class BimanualDirect(DirectRLEnv):
         #   - the joint coordinates for the action computed by the IKDifferentialController and
         #   - the joint coordinates for the hand.
         self.reset_joint_positions[idx][env_ids] = torch.cat((self.controller.compute(ee_pos_r, ee_quat_r, jacobian, joint_pos), 
-                                         self.default_joint_pos[idx][:, (6+idx):]), 
+                                         self.default_joint_pos[idx][:, len(self.cfg.joints[idx]):]), 
                                          dim=-1)[env_ids]
         joint_pos = torch.cat((self.controller.compute(ee_pos_r, ee_quat_r, jacobian, joint_pos), 
-                               self.default_joint_pos[idx][:, (6+idx):]), 
+                               self.default_joint_pos[idx][:, len(self.cfg.joints[idx]):]), 
                                dim=-1)[env_ids] 
         
         # Obtains the joint velocities
