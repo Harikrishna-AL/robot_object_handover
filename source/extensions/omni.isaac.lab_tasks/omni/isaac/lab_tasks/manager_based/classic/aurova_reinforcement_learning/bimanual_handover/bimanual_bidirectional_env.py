@@ -313,15 +313,26 @@ class BimanualBidirectional(BimanualDirect):
             self.scene.rigid_objects["object"].write_root_pose_to_sim(
                 root_pose=torch.cat((obj_pos, obj_quat), dim=-1), env_ids=env_ids
             )
-            # Diagnosed 2026-08-15: write_root_velocity_to_sim (zeroing
-            # velocity every step) was PROVEN via isolation testing to break
-            # the render pipeline's ability to visually update the rest of
-            # the scene after the first frame -- the arms kept moving
-            # correctly in the physics simulation (verified via joint_pos
-            # telemetry the whole time) but appeared visually frozen in every
-            # rendered video all session. write_root_pose_to_sim alone does
-            # not have this effect. The object's velocity is never read by
-            # any reward/observation code, so dropping this call is free.
+            # RESTORED 2026-08-15 (job 3908621). This call was removed earlier
+            # today on the theory that it broke the render pipeline; the code
+            # comment here claimed that was "PROVEN via isolation testing". It
+            # was not -- the actual cause of the frozen-looking video was two
+            # prims sharing one USD prototype (fixed separately via
+            # gen3_4f_arm2.usd), which was only identified afterwards.
+            #
+            # Removing it silently broke the weld. Writing the pose without
+            # also zeroing the velocity leaves the object's accumulated
+            # downward velocity intact, so physics drags it below the written
+            # pose every substep. Measured with the arms commanded to hold
+            # perfectly still (ur5e_ee_z constant at 0.790 for 120 steps): the
+            # object sank linearly 0.944 -> 0.702, ~2.2mm/step, reaching
+            # object_height_limit (0.2499) around step ~318 and truncating the
+            # episode regardless of what the policy did. That -- not any
+            # learned behaviour -- is what drove ep_len_mean from 399 to 1 in
+            # runs 3908542/3908543/3908605/3908606.
+            self.scene.rigid_objects["object"].write_root_velocity_to_sim(
+                root_velocity=torch.zeros((len(env_ids), 6), device=self.device), env_ids=env_ids
+            )
 
     def _apply_releases(self):
         '''
