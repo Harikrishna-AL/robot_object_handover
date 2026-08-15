@@ -239,12 +239,14 @@ class BimanualBidirectionalCfg(BimanualDirectCfg):
     # (2026-08-15). At 2.0 with the old hand-inclusive sensor this cost ~-86
     # per episode purely for bringing the hands together.
     lambda_arm_collision: float = 0.5
-    # Lowered 3.0 -> 1.0 for the staged reward (2026-08-15): the old term was
-    # multiplied by exp(-k_decay*d), which made it ~0 except in the last few
-    # centimetres. The staged version applies it flat across stages 1-2, so at
-    # the old weight a merely-drifting holder could out-cost the entire
-    # approach shaping budget.
-    lambda_holder_still: float = 1.0
+    # 3.0 -> 1.0 -> 0.0 (2026-08-15). Now redundant: stage_gate_arms freezes
+    # the holder outright at stage 1, which enforces the same thing far more
+    # directly. Measured at 0.04-0.08/step in runs 3908542/3908543 EVEN WITH
+    # the freeze on (freezing the commanded increment leaves residual settling
+    # velocity), making it a permanent unavoidable drain -- the main reason
+    # per-step reward went net negative and the policy started truncating
+    # episodes on purpose. Raise above 0 only if stage_gate_arms is disabled.
+    lambda_holder_still: float = 0.0
 
     apply_range = [False, False]
 
@@ -305,6 +307,16 @@ class BimanualBidirectionalCfg(BimanualDirectCfg):
     # the policy is always paid more for the next rung than for cycling on the
     # current one; a full success is ~375 including shaping, versus Run A's
     # flat ~79 that came almost entirely from an unconditional contact term.
+    # Charged once when an episode ends via truncation (arm/object falling,
+    # ground contact, velocity limit) rather than by timing out or succeeding.
+    # Without this, ending the episode early is worth ~0 while playing it out
+    # accumulates whatever the per-step reward happens to be -- so any net
+    # negative per-step reward makes deliberate self-termination the optimal
+    # policy, which is exactly what runs 3908542/3908543 converged to
+    # (ep_len_mean 399 -> 1). Sized to exceed the worst plausible per-episode
+    # shaping loss so surviving always dominates.
+    penalty_truncation: float = 50.0
+
     bonus_present: float = 25.0
     bonus_touch: float = 50.0
     bonus_grasp: float = 100.0

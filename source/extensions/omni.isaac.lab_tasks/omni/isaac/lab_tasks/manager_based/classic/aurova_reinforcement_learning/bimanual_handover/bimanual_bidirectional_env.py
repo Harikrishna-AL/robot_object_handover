@@ -108,6 +108,10 @@ class BimanualBidirectional(BimanualDirect):
         # rather than reading inf as an enormous improvement.
         self.prev_present_dist = torch.full((self.num_envs,), torch.inf, device=self.device)
         self.prev_reach_dist = torch.full((self.num_envs,), torch.inf, device=self.device)
+        # Set by _get_dones, consumed by _get_rewards (dones runs first in
+        # DirectRLEnv.step). Initialised here so the very first _get_rewards
+        # call is safe if the order ever changes.
+        self._last_truncated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # Per-arm pose bookkeeping filled in by update_new_poses(); replaces
         # the parent's GEN3-only singular tensors of the same name/purpose.
@@ -836,11 +840,29 @@ class BimanualBidirectional(BimanualDirect):
 
         # ---- penalties ---------------------------------------------------
         # Holder must present a stable target while the receiver closes in.
+        # Defaults to lambda 0 now that stage_gate_arms freezes the holder
+        # outright -- runs 3908542/3908543 still measured 0.04-0.08/step here
+        # WITH the freeze active, because zeroing the Cartesian increment does
+        # not zero the arm's residual settling velocity. That was a constant
+        # unavoidable drain the policy could only escape by ending the episode.
         holder_speed = torch.norm(
             self.scene.articulations[cfg.keys[holder_idx]].data.body_state_w[:, self.ee_jacobi_idx[holder_idx] + 1, 7:], dim=-1
         )
         holder_still_penalty = cfg.lambda_holder_still * holder_speed * receiver_active.float()
         reward = reward - holder_still_penalty
+
+        # Truncation penalty. Diagnosed 2026-08-15 from runs 3908542/3908543:
+        # ep_len_mean collapsed from 399 to 1-30 steps in both, while stage2
+        # and reward peaked around iteration 35-98 and then decayed. Per-step
+        # reward was net negative (~-0.06 to -0.10, dominated by the holder
+        # penalty above), so ending the episode immediately scored ~0 and was
+        # strictly better than playing it out -- the policy was deliberately
+        # driving an arm into the ground/height limit to stop the bleeding.
+        # Charging for a truncated ending makes surviving the better option
+        # again; combined with lambda_holder_still=0 the per-step floor is now
+        # ~0 rather than negative.
+        truncation_penalty = cfg.penalty_truncation * self._last_truncated.float()
+        reward = reward - truncation_penalty
 
         arm_arm_contact = (self.contacts[:, -1] > 0.0).float()
         reward = reward - cfg.lambda_arm_collision * arm_arm_contact
@@ -866,6 +888,7 @@ class BimanualBidirectional(BimanualDirect):
         log["reward_terms/shaping_present"] = (cfg.w_present * d_present * holder_active.float()).mean().item()
         log["reward_terms/shaping_reach"] = (cfg.w_reach * d_reach * receiver_active.float()).mean().item()
         log["reward_terms/holder_still_penalty"] = holder_still_penalty.mean().item()
+        log["reward_terms/truncation_penalty"] = truncation_penalty.mean().item()
         for key, value in force_log.items():
             log[f"reward_terms/{key}"] = value.mean().item() if torch.is_tensor(value) else value
 
@@ -977,12 +1000,26 @@ class BimanualBidirectional(BimanualDirect):
         indet = self.transfer_complete & truncated
         fail = ~self.transfer_complete & (terminated | truncated)
 
+        # Stashed for _get_rewards, which runs immediately after _get_dones in
+        # DirectRLEnv.step and charges cfg.penalty_truncation for ending an
+        # episode this way. See the reward's own comment for why.
+        self._last_truncated = truncated
+
         if "log" not in self.extras:
             self.extras["log"] = dict()
         self.extras["log"]["metrics/outcome_success"] = success.float().mean().item()
         self.extras["log"]["metrics/outcome_indetermination"] = indet.float().mean().item()
         self.extras["log"]["metrics/outcome_fail"] = fail.float().mean().item()
         self.extras["log"]["metrics/out_of_bounds"] = out_of_bounds.float().mean().item()
+        # Per-cause truncation logging (2026-08-15): runs 3908542/3908543 saw
+        # ep_len_mean collapse from 399 to 1-30 steps while out_of_bounds
+        # stayed at exactly 0, so the cause was falling or ground contact --
+        # but the three were only ever logged as one aggregate, leaving no way
+        # to tell which. Split out so the next run answers it directly.
+        self.extras["log"]["metrics/trunc_ground_contact"] = ground_contact.float().mean().item()
+        self.extras["log"]["metrics/trunc_arm_falling"] = torch.logical_or(ur5e_falling, gen3_falling).float().mean().item()
+        self.extras["log"]["metrics/trunc_object_falling"] = object_falling.float().mean().item()
+        self.extras["log"]["metrics/trunc_any"] = truncated.float().mean().item()
 
         return truncated, terminated
 
