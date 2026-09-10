@@ -322,6 +322,37 @@ class BimanualBidirectionalCfg(BimanualDirectCfg):
     bonus_grasp: float = 100.0
     bonus_transfer: float = 200.0
 
+    # ------------------------------------------------------------------
+    # Reverse curriculum (2026-09-10, PI's suggestion)
+    # ------------------------------------------------------------------
+    # Standard reverse-curriculum idea (Florensa et al., CoRL 2017): start
+    # episodes NEAR the goal so the policy succeeds immediately and has a
+    # reward signal at all, then walk the start state backwards as it
+    # improves.
+    #
+    # Motivated directly by the eval histogram of jobs 3908719/3908720: 66%
+    # of episodes reach "hand touching the object" and only 0-3% reach "has a
+    # grip". Approach is solved; the unsolved part is the single most
+    # contact-rich instant, and under the normal reset the policy only gets
+    # one attempt at that instant per episode -- after a long approach it
+    # usually mistimes. Starting the receiver already at the object gives it
+    # thousands of repetitions of the grip specifically.
+    use_reverse_curriculum: bool = True
+
+    # Fraction of the way from the receiver's sampled home pose to the
+    # object's grasp point at episode start. 1.0 would be exactly on the
+    # object; 0.0 is the normal reset (hardest, == the 3908719/3908720 runs).
+    # The last entry MUST be 0.0 so the final level is the real task.
+    curriculum_start_frac: list = [0.90, 0.70, 0.45, 0.20, 0.0]
+
+    # Promotion/demotion on a rolling window of completed episodes. Demotion
+    # matters as much as promotion: if a level turns out to be too hard the
+    # run drops back rather than flatlining at 0 for the rest of training,
+    # which is the failure mode every previous run had.
+    curriculum_window: int = 200
+    curriculum_promote_rate: float = 0.60
+    curriculum_demote_rate: float = 0.15
+
 
 
 

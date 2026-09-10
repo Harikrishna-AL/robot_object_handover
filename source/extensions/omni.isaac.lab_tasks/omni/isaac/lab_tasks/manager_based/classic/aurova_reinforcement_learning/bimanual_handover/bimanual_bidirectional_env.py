@@ -113,6 +113,14 @@ class BimanualBidirectional(BimanualDirect):
         # call is safe if the order ever changes.
         self._last_truncated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
+        # --- Reverse curriculum state (2026-09-10) -------------------------
+        # One global level shared by all envs (not per-env): promotion is
+        # decided from a pooled success rate, so a per-env level would just
+        # add variance without adding signal.
+        self.curriculum_level = 0
+        self._curr_ep_count = 0
+        self._curr_succ_count = 0
+
         # Per-arm pose bookkeeping filled in by update_new_poses(); replaces
         # the parent's GEN3-only singular tensors of the same name/purpose.
         self.rot_ee_pose_r = [torch.zeros((self.num_envs, 7), device=self.device) for _ in self.cfg.keys]
@@ -1032,6 +1040,12 @@ class BimanualBidirectional(BimanualDirect):
         self.extras["log"]["metrics/trunc_object_falling"] = object_falling.float().mean().item()
         self.extras["log"]["metrics/trunc_any"] = truncated.float().mean().item()
 
+        self._update_curriculum(success, torch.logical_or(truncated, terminated))
+        self.extras["log"]["metrics/curriculum_level"] = float(self.curriculum_level)
+        self.extras["log"]["metrics/curriculum_start_frac"] = float(
+            self.cfg.curriculum_start_frac[min(self.curriculum_level, len(self.cfg.curriculum_start_frac) - 1)]
+        )
+
         return truncated, terminated
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
@@ -1075,3 +1089,129 @@ class BimanualBidirectional(BimanualDirect):
         handoff = 0.5 * (ee_holder + ee_receiver)
         handoff[:, 2] = handoff[:, 2] + self.cfg.handoff_height_offset
         self.handoff_pos[env_ids] = handoff
+
+        self._apply_curriculum_reset(env_ids)
+
+    def _apply_curriculum_reset(self, env_ids: Sequence[int]):
+        '''
+        Reverse curriculum: move the receiver's starting pose a fraction of the
+        way toward the object's grasp point, and start the episode already at
+        stage 1 (object presented, giver frozen, receiver free to move).
+
+        At the easiest level the receiver begins essentially on the object, so
+        the ONLY thing left to learn is closing the hand and holding -- the
+        exact transition that jobs 3908719/3908720 failed at (66% reached
+        "touching", 0-3% reached "gripped"). As the pooled success rate passes
+        cfg.curriculum_promote_rate the start pose walks back toward the normal
+        reset, and the final level (frac 0.0) IS the unmodified task, so a run
+        that reaches the last level is directly comparable to those two.
+
+        Only the receiver is moved. Moving the meeting point instead would be
+        simpler but cannot work: the two arms sit ~0.37m apart, so any meeting
+        point that is easy for the receiver to reach is correspondingly far for
+        the giver, and the curriculum would make one arm's job easier only by
+        making the other's harder.
+
+        LIMITATION (revisit after the first videos): only the POSITION is
+        interpolated -- the wrist keeps its sampled home orientation. There is
+        no defined "correct" grasp orientation in the config to interpolate
+        toward. If the videos show the hand arriving at the object badly
+        oriented at the easy levels, that is this, and it needs a target
+        orientation rather than more training.
+        '''
+        cfg = self.cfg
+        if not cfg.use_reverse_curriculum:
+            return
+        level = min(self.curriculum_level, len(cfg.curriculum_start_frac) - 1)
+        frac = cfg.curriculum_start_frac[level]
+        if frac <= 0.0:
+            return  # hardest level == the normal reset, leave it untouched
+
+        receiver = cfg.GEN3
+        key = cfg.keys[receiver]
+
+        # Object's world pose, derived ANALYTICALLY rather than read back from
+        # the sim. super()._reset_idx() has just written both the arm joint
+        # states and the object root pose this same call, and those writes are
+        # not guaranteed to be visible in data.body_state_w until the next sim
+        # step -- reading it here can return the PREVIOUS episode's pose and
+        # would aim the curriculum placement at a stale target. The chain
+        # root -> commanded home EE -> fixed object offset uses only the
+        # articulation root (which never moves) plus values we just set.
+        giver = cfg.UR5e
+        giver_root_w = self.scene.articulations[cfg.keys[giver]].data.root_state_w[:, 0:7]
+        home_giver = self.reset_robot_poses_r[giver]
+        ee_pos_w, ee_quat_w = combine_frame_transforms(
+            t01=giver_root_w[:, :3], q01=giver_root_w[:, 3:],
+            t12=home_giver[:, :3], q12=home_giver[:, 3:],
+        )
+        obj_pos_w, obj_quat_w = combine_frame_transforms(
+            t01=ee_pos_w, q01=ee_quat_w,
+            t12=cfg.obj_pos_trans, q12=cfg.obj_quat_trans,
+        )
+        obj_pose_w = torch.cat((obj_pos_w, obj_quat_w), dim=-1)
+
+        # Object's grasp point, expressed in the receiver's root frame.
+        gp_pos_w, gp_quat_w = combine_frame_transforms(
+            t01=obj_pose_w[:, :3], q01=obj_pose_w[:, 3:],
+            t12=cfg.grasp_obs_obj_pos_trans, q12=cfg.grasp_obs_obj_quat_trans,
+        )
+        root_w = self.scene.articulations[key].data.root_state_w[:, 0:7]
+        gp_pos_r, _ = subtract_frame_transforms(
+            t01=root_w[:, :3], q01=root_w[:, 3:], t02=gp_pos_w, q02=gp_quat_w
+        )
+
+        # Interpolate home -> grasp point. Orientation is left at home (see docstring).
+        home = self.reset_robot_poses_r[receiver]
+        target = home.clone()
+        target[:, :3] = home[:, :3] + frac * (gp_pos_r - home[:, :3])
+
+        # Same IK-and-write pattern the parent uses for the normal reset pose.
+        self.controller.set_command(target)
+        ee_pos_r, ee_quat_r, jacobian, joint_pos = self._get_ee_pose(receiver)
+        arm_q = self.controller.compute(ee_pos_r, ee_quat_r, jacobian, joint_pos)
+        joint_pos_full = torch.cat(
+            (arm_q, self.default_joint_pos[receiver][:, len(cfg.joints[receiver]):]), dim=-1
+        )
+        joint_vel = self.scene.articulations[key].data.default_joint_vel
+        self.scene.articulations[key].write_joint_state_to_sim(
+            joint_pos_full[env_ids], joint_vel[env_ids], None, env_ids
+        )
+        # Keep the running IK/action target consistent with where the arm now
+        # actually is, otherwise the first perform_increment would command it
+        # straight back to the un-curriculumed home pose.
+        self.reset_joint_positions[receiver][env_ids] = joint_pos_full[env_ids]
+        self.actions[receiver][env_ids] = joint_pos_full[env_ids]
+
+        # Begin already presented: _gate_arm_motion freezes the giver at
+        # stage >= 1 and releases the receiver, which is the state the easy
+        # levels are meant to drill.
+        self.stage[env_ids] = 1
+        self.handoff_pos[env_ids] = obj_pose_w[env_ids, :3]
+
+    def _update_curriculum(self, success: torch.Tensor, done: torch.Tensor):
+        '''
+        Pooled promote/demote on a rolling window of completed episodes.
+        Demotion is deliberate: every previous run's failure mode was sitting
+        at 0% for hundreds of iterations with no way back, so a level that
+        turns out to be too hard should drop rather than stall.
+        '''
+        cfg = self.cfg
+        if not cfg.use_reverse_curriculum:
+            return
+        n_done = int(done.sum().item())
+        if n_done == 0:
+            return
+        self._curr_ep_count += n_done
+        self._curr_succ_count += int((success & done).sum().item())
+        if self._curr_ep_count < cfg.curriculum_window:
+            return
+
+        rate = self._curr_succ_count / max(self._curr_ep_count, 1)
+        max_level = len(cfg.curriculum_start_frac) - 1
+        if rate >= cfg.curriculum_promote_rate and self.curriculum_level < max_level:
+            self.curriculum_level += 1
+        elif rate < cfg.curriculum_demote_rate and self.curriculum_level > 0:
+            self.curriculum_level -= 1
+        self._curr_ep_count = 0
+        self._curr_succ_count = 0
