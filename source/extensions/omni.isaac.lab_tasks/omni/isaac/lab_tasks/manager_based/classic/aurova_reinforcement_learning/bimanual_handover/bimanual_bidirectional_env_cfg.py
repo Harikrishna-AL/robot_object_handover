@@ -349,6 +349,11 @@ class BimanualBidirectionalCfg(BimanualDirectCfg):
     # matters as much as promotion: if a level turns out to be too hard the
     # run drops back rather than flatlining at 0 for the rest of training,
     # which is the failure mode every previous run had.
+    # Iterations for the one-off IK solve that finds the "hand on the object"
+    # joint configuration. A single differential step is nowhere near enough
+    # for a ~0.3m target -- see _precompute_object_reach_q.
+    curriculum_ik_iters: int = 40
+
     curriculum_window: int = 200
     curriculum_promote_rate: float = 0.60
     curriculum_demote_rate: float = 0.15

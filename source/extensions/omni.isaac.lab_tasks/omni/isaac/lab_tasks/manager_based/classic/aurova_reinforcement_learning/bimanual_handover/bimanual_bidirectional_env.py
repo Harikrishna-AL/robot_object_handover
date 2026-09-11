@@ -120,6 +120,89 @@ class BimanualBidirectional(BimanualDirect):
         self.curriculum_level = 0
         self._curr_ep_count = 0
         self._curr_succ_count = 0
+        # Arm joint configuration that puts the receiver's hand on the object.
+        # Solved once here (see _precompute_object_reach_q) and reused, because
+        # cfg.apply_range is [False, False] -- neither arm's reset pose is
+        # randomised, so this target is identical in every episode.
+        self._q_at_object = None
+        if self.cfg.use_reverse_curriculum:
+            self._precompute_object_reach_q()
+
+    def _precompute_object_reach_q(self):
+        '''
+        Iteratively solve IK for "receiver's end effector at the object's grasp
+        point", once, at construction.
+
+        Why iteratively, and why here:
+
+        DifferentialIKController.compute() takes a SINGLE differential step --
+        it linearises about the current pose and applies one Jacobian-pseudo-
+        inverse correction. That is fine for the small corrections the parent
+        uses it for, but the curriculum target is ~0.3m away, where the linear
+        approximation lands far short. Diagnosed by job 4166551: every
+        curriculum level placed the hand at a near-identical ~0.27-0.28m from
+        the object regardless of its frac, i.e. the same small step each time,
+        versus 0.334m for no curriculum at all. Level 0 was supposed to be
+        ~0.03m.
+
+        The iteration cannot live in _reset_idx: that runs OUTSIDE the physics
+        loop, so stepping the sim there would advance every environment,
+        including the ones not resetting, and corrupt their episodes. At
+        construction no episode is in flight, so stepping is safe.
+        '''
+        cfg = self.cfg
+        receiver, giver = cfg.GEN3, cfg.UR5e
+        key = cfg.keys[receiver]
+
+        # Deterministic home EE poses, taken straight from cfg: with
+        # apply_range all-False, ee_pose_ranges collapses to a point and
+        # sample_uniform returns cfg.ee_init_pose exactly.
+        def home_pose_w(idx):
+            p = torch.tensor(cfg.ee_init_pose[idx], dtype=torch.float32, device=self.device)
+            pos_r = p[:3].unsqueeze(0).repeat(self.num_envs, 1)
+            quat_r = quat_from_euler_xyz(
+                roll=p[3].repeat(self.num_envs), pitch=p[4].repeat(self.num_envs), yaw=p[5].repeat(self.num_envs)
+            )
+            root = self.scene.articulations[cfg.keys[idx]].data.root_state_w[:, 0:7]
+            return combine_frame_transforms(t01=root[:, :3], q01=root[:, 3:], t12=pos_r, q12=quat_r), (pos_r, quat_r)
+
+        (giver_ee_pos_w, giver_ee_quat_w), _ = home_pose_w(giver)
+        obj_pos_w, obj_quat_w = combine_frame_transforms(
+            t01=giver_ee_pos_w, q01=giver_ee_quat_w, t12=cfg.obj_pos_trans, q12=cfg.obj_quat_trans
+        )
+        gp_pos_w, gp_quat_w = combine_frame_transforms(
+            t01=obj_pos_w, q01=obj_quat_w,
+            t12=cfg.grasp_obs_obj_pos_trans, q12=cfg.grasp_obs_obj_quat_trans,
+        )
+        root_w = self.scene.articulations[key].data.root_state_w[:, 0:7]
+        gp_pos_r, _ = subtract_frame_transforms(
+            t01=root_w[:, :3], q01=root_w[:, 3:], t02=gp_pos_w, q02=gp_quat_w
+        )
+
+        _, (home_pos_r, home_quat_r) = home_pose_w(receiver)
+        target = torch.cat((gp_pos_r, home_quat_r), dim=-1)  # position only; see _apply_curriculum_reset
+
+        n_arm = len(cfg.joints[receiver])
+        dt = self.sim.get_physics_dt() if hasattr(self.sim, "get_physics_dt") else self.cfg.sim.dt
+        q = None
+        for _ in range(cfg.curriculum_ik_iters):
+            self.controller.set_command(target)
+            ee_pos_r, ee_quat_r, jacobian, joint_pos = self._get_ee_pose(receiver)
+            arm_q = self.controller.compute(ee_pos_r, ee_quat_r, jacobian, joint_pos)
+            q = torch.cat((arm_q, self.default_joint_pos[receiver][:, n_arm:]), dim=-1)
+            self.scene.articulations[key].write_joint_state_to_sim(
+                q, torch.zeros_like(q), None, None
+            )
+            self.scene.write_data_to_sim()
+            self.sim.step(render=False)
+            self.scene.update(dt)
+
+        self._q_at_object = q.clone()
+        self._curriculum_obj_pos_w = obj_pos_w.clone()
+        tips = self.scene.articulations[key].data.body_state_w[:, self.finger_tips[receiver], 0:3].mean(1)
+        reached = torch.norm(tips - gp_pos_w, dim=-1).mean().item()
+        print(f"[curriculum] IK solve: fingertips {reached:.4f} m from grasp point "
+              f"after {cfg.curriculum_ik_iters} iters", flush=True)
 
         # Per-arm pose bookkeeping filled in by update_new_poses(); replaces
         # the parent's GEN3-only singular tensors of the same name/purpose.
@@ -1130,6 +1213,35 @@ class BimanualBidirectional(BimanualDirect):
         receiver = cfg.GEN3
         key = cfg.keys[receiver]
 
+        # Joint-space interpolation between the home configuration and the
+        # precomputed "hand on the object" configuration. Replaces the original
+        # single-differential-IK-step placement, which job 4166551 showed moved
+        # the arm the same ~5cm at every level regardless of frac (see
+        # _precompute_object_reach_q for why). Interpolating in joint space is
+        # not exactly linear in Cartesian distance, but it is monotone in frac,
+        # which is all a curriculum needs, and it requires no IK at reset time.
+        if self._q_at_object is not None:
+            receiver = cfg.GEN3
+            key = cfg.keys[receiver]
+            n_arm = len(cfg.joints[receiver])
+            q_home = self.reset_joint_positions[receiver]
+            q_new = q_home.clone()
+            q_new[:, :n_arm] = q_home[:, :n_arm] + frac * (self._q_at_object[:, :n_arm] - q_home[:, :n_arm])
+            joint_vel = self.scene.articulations[key].data.default_joint_vel
+            self.scene.articulations[key].write_joint_state_to_sim(
+                q_new[env_ids], joint_vel[env_ids], None, env_ids
+            )
+            # Keep the running IK/action target consistent with where the arm
+            # now is, or the first perform_increment drives it back to home.
+            self.reset_joint_positions[receiver][env_ids] = q_new[env_ids]
+            self.actions[receiver][env_ids] = q_new[env_ids]
+
+            self.stage[env_ids] = 1
+            self.handoff_pos[env_ids] = self._curriculum_obj_pos_w[env_ids] \
+                if getattr(self, "_curriculum_obj_pos_w", None) is not None else self.handoff_pos[env_ids]
+            return
+
+        # --- fallback: original per-reset IK path (only if precompute failed) ---
         # Object's world pose, derived ANALYTICALLY rather than read back from
         # the sim. super()._reset_idx() has just written both the arm joint
         # states and the object root pose this same call, and those writes are
