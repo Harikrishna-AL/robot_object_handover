@@ -132,6 +132,29 @@ class BimanualBidirectional(BimanualDirect):
         # recomputed the same correction and reapplied it. The curriculum now
         # moves the HANDOFF POINT instead of the arm; see _apply_curriculum_reset.
 
+        # Per-arm pose bookkeeping filled in by update_new_poses(); replaces
+        # the parent's GEN3-only singular tensors of the same name/purpose.
+        self.rot_ee_pose_r = [torch.zeros((self.num_envs, 7), device=self.device) for _ in self.cfg.keys]
+        self.tips_pose_r = [torch.zeros((self.num_envs, 7), device=self.device) for _ in self.cfg.keys]
+        self.tips_pose_r_back = [torch.zeros((self.num_envs, 7), device=self.device) for _ in self.cfg.keys]
+        self.grasp_point_obj_pose_r = [torch.zeros((self.num_envs, 7), device=self.device) for _ in self.cfg.keys]
+
+        # Contact sensor columns are [ur5e_w_ground, gen3_w_ground,
+        # ur5e_block(ARM_CONTACT_WIDTH), gen3_block(ARM_CONTACT_WIDTH),
+        # robot1_w_robot2] -- see update_collisions_bidirectional(). Slice
+        # once here rather than recomputing every reward step.
+        self._ur5e_contact_slice = slice(NUM_GLOBAL_CONTACTS, NUM_GLOBAL_CONTACTS + ARM_CONTACT_WIDTH)
+        self._gen3_contact_slice = slice(
+            NUM_GLOBAL_CONTACTS + ARM_CONTACT_WIDTH, NUM_GLOBAL_CONTACTS + 2 * ARM_CONTACT_WIDTH
+        )
+
+        # NOTE (v1 scope cuts, not wired up for this env): debug marker
+        # visualization (update_markers(), inherited from BimanualDirect)
+        # still reads the parent's GEN3-only debug_* buffers, which
+        # update_new_poses() below no longer populates -- leave
+        # cfg.debug_markers False. Camera rendering (render_imgs/save_imgs)
+        # is likewise not reproduced here.
+
     # Only line that differs from BimanualDirect._setup_scene: mirrored
     # contact sensors for both arms instead of GEN3 only.
     def _setup_scene(self):
