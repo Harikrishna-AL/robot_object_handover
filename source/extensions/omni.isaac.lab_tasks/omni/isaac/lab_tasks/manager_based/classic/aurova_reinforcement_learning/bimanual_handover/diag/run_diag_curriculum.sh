@@ -11,19 +11,32 @@
 #SBATCH --job-name=diag-curriculum
 #SBATCH --output=/home/hapi039h/diag_curriculum_%j.log
 #
-# Verifies the reverse-curriculum reset placement. Run this BEFORE committing
-# a 6-hour training run to the curriculum.
+# Verifies the reverse-curriculum reset placement. Run BEFORE committing a long
+# training run to the curriculum.
+#
+# set -euo pipefail is deliberate. The first version of this script had no error
+# handling: on 2026-09-11 every setup step failed (workspace not mounted on the
+# compute node), the container never even started, and the script still printed
+# its DONE line and exited 0 -- SLURM reported COMPLETED for a job that did
+# nothing. A job that claims success after failing is worse than one that crashes.
+set -euo pipefail
 
-WS=/data/cat/ws/hapi039h-isaac
+# Everything is sourced from /home. Diagnosed 2026-09-11: the workspace
+# filesystems (/data/cat AND /data/horse) are not mounted on Capella compute
+# nodes -- probed three nodes (c3, c156 x2), none could see either, while /home
+# was visible on all three. /home is NFS and always available.
+TREE=/home/hapi039h/isaaclab
+SIF=/home/hapi039h/isaac-lab-base.sif
 TASKDIR=source/extensions/omni.isaac.lab_tasks/omni/isaac/lab_tasks/manager_based/classic/aurova_reinforcement_learning/bimanual_handover
 
-rsync -a --delete --exclude wandb --exclude logs --exclude outputs --exclude __pycache__ --exclude _isaac_sim \
-  /home/hapi039h/isaaclab/source/ "$WS/isaaclab/source/"
+echo "NODE=$(hostname)"
+test -d "$TREE" || { echo "FATAL: tree missing: $TREE"; exit 1; }
+test -f "$SIF"  || { echo "FATAL: sif missing: $SIF";  exit 1; }
 
 dir_name="isaaclab_${SLURM_JOB_ID:-$$}"
-cp -r "$WS/isaaclab" "$TMPDIR/$dir_name"
+cp -r "$TREE" "$TMPDIR/$dir_name"
 ln -sf /isaac-sim "$TMPDIR/$dir_name/_isaac_sim"
-cp "$WS/isaac-lab-base.sif" "$TMPDIR/isaac-lab-base.sif"
+cp "$SIF" "$TMPDIR/isaac-lab-base.sif"
 
 CACHE="$TMPDIR/local_cache"
 mkdir -p "$CACHE/kit" "$CACHE/glcache" "$CACHE/computecache" "$CACHE/ov"

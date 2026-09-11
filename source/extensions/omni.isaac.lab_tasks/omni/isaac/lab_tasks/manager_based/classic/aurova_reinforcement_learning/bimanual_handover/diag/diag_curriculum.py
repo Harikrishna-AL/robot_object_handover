@@ -40,7 +40,7 @@ recv = u.scene.articulations[u.cfg.keys[R]]
 n_levels = len(u.cfg.curriculum_start_frac)
 
 print(f"curriculum_start_frac = {list(u.cfg.curriculum_start_frac)}", flush=True)
-print(f"\n{'lvl':>3} {'frac':>6} | {'tips->obj mean':>14} {'min':>7} {'max':>7} {'spread':>7} | {'stage':>5}", flush=True)
+print(f"\n{'lvl':>3} {'frac':>6} | {'tips->handoff':>14} {'min':>7} {'max':>7} {'spread':>7} | {'stage':>5}", flush=True)
 print("-" * 72, flush=True)
 
 zero = torch.zeros((args_cli.num_envs, env.action_space.shape[-1]))
@@ -51,16 +51,21 @@ for level in range(n_levels):
     for _ in range(args_cli.settle_steps):
         env.step(zero)
 
-    obj = u.scene.rigid_objects["object"].data.body_state_w[:, 0, :3]           # (N,3)
+    # The curriculum moves the HANDOFF POINT, not the arm, so the quantity that
+    # should shrink with an easier level is how far the receiver's hand has to
+    # travel to the meeting point -- not its distance to the object, which sits
+    # in the giver's hand at reset regardless of level.
+    handoff = u.handoff_pos                                                     # (N,3)
     tips = recv.data.body_state_w[:, u.finger_tips[R], 0:3]                     # (N,T,3)
-    d = torch.norm(tips - obj.unsqueeze(1), dim=-1)                             # (N,T)
+    d = torch.norm(tips - handoff.unsqueeze(1), dim=-1)                         # (N,T)
     mean_d = d.mean().item(); min_d = d.min(dim=-1).values.mean().item()
     max_d = d.max(dim=-1).values.mean().item(); spread = (max_d - min_d)
     stage = u.stage.float().mean().item()
     frac = u.cfg.curriculum_start_frac[level]
     print(f"{level:>3} {frac:>6.2f} | {mean_d:>14.4f} {min_d:>7.4f} {max_d:>7.4f} {spread:>7.4f} | {stage:>5.2f}", flush=True)
 
-print("\nEXPECTED: mean distance rises with level; level 0 should be small (<~0.06 m).", flush=True)
-print("If mean is small but spread is large, position is right and ORIENTATION is the gap.", flush=True)
+print("\nEXPECTED: distance to handoff point RISES with level; level 0 near 0,", flush=True)
+print("level 4 (no curriculum) = the normal midpoint distance.", flush=True)
+
 print("DONE", flush=True)
 simulation_app.close()
