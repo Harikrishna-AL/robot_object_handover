@@ -93,7 +93,13 @@ class BimanualDirectICL(BimanualDirect):
         # rescaling is not reaching the sampler and the run is meaningless --
         # which is exactly the failure mode that went unnoticed in the
         # self-play curriculum until a dedicated diagnostic caught it.
-        obj_pos = self.scene.rigid_objects["object"].data.body_state_w[:, 0, :3]
+        # MUST be env-local. Measured in world coordinates this is dominated by
+        # the environment grid (256 envs at 2.5m spacing -> std ~7.7m), which
+        # swamps the +/-0.15m the curriculum actually varies. Job 4205270
+        # logged exactly that useless 7.7 before this was corrected.
+        obj_pos = (
+            self.scene.rigid_objects["object"].data.body_state_w[:, 0, :3] - self.scene.env_origins
+        )
         self.extras["log"]["metrics/obj_pos_spread"] = obj_pos.std(dim=0).mean().item()
 
         return truncated, terminated
