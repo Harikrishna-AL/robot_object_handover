@@ -47,5 +47,18 @@ class BimanualDirectICLCfg(BimanualDirectCfg):
     # Demotion included deliberately: it lets a run that over-promotes recover
     # instead of flatlining, which is how every previous run failed.
     icl_window: int = 200
-    icl_promote_rate: float = 0.60
-    icl_demote_rate: float = 0.15
+    # Lowered 0.60 -> 0.05 (2026-09-16). At 0.60 the curriculum never advanced:
+    # job 4211349 spent all 290M steps pinned at level 0 while the baseline
+    # reached only 0.3% success, so the "curriculum" was really just a fixed
+    # easiest setting -- and it scored -29 reward with ZERO successes against
+    # the baseline's +1190. A threshold the task cannot reach is not a
+    # curriculum.
+    icl_promote_rate: float = 0.05
+    icl_demote_rate: float = 0.01
+
+    # Safety net so the curriculum traverses its levels even if the success
+    # threshold is still never reached. Without this the run silently
+    # degenerates into single-difficulty training again, which is exactly the
+    # failure 4211349 produced. Promote after this many completed episodes at
+    # one level regardless of success rate.
+    icl_force_promote_episodes: int = 20000

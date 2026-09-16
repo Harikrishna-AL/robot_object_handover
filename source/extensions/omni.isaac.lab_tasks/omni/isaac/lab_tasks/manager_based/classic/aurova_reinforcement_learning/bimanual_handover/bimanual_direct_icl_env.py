@@ -26,6 +26,7 @@ class BimanualDirectICL(BimanualDirect):
         self.icl_level = 0
         self._icl_ep_count = 0
         self._icl_succ_count = 0
+        self._icl_eps_at_level = 0
 
         # ee_pose_ranges is [num_robots, 6, 2]: per DOF, [lo, hi] for the
         # uniform sample drawn at reset. The parent builds it once in __init__
@@ -58,18 +59,32 @@ class BimanualDirectICL(BimanualDirect):
         if n_done == 0:
             return
         self._icl_ep_count += n_done
+        self._icl_eps_at_level += n_done
         self._icl_succ_count += int((success & done).sum().item())
+
+        # Forced promotion: guarantees the curriculum actually moves through
+        # its levels. See cfg.icl_force_promote_episodes.
+        max_level = len(self.cfg.icl_range_scale) - 1
+        if self._icl_eps_at_level >= self.cfg.icl_force_promote_episodes and self.icl_level < max_level:
+            self.icl_level += 1
+            self._apply_icl_level()
+            self._icl_eps_at_level = 0
+            self._icl_ep_count = 0
+            self._icl_succ_count = 0
+            return
+
         if self._icl_ep_count < self.cfg.icl_window:
             return
 
         rate = self._icl_succ_count / max(self._icl_ep_count, 1)
-        max_level = len(self.cfg.icl_range_scale) - 1
         if rate >= self.cfg.icl_promote_rate and self.icl_level < max_level:
             self.icl_level += 1
             self._apply_icl_level()
+            self._icl_eps_at_level = 0
         elif rate < self.cfg.icl_demote_rate and self.icl_level > 0:
             self.icl_level -= 1
             self._apply_icl_level()
+            self._icl_eps_at_level = 0
         self._icl_ep_count = 0
         self._icl_succ_count = 0
 
