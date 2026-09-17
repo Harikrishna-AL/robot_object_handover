@@ -27,6 +27,7 @@ class BimanualDirectICL(BimanualDirect):
         self._icl_ep_count = 0
         self._icl_succ_count = 0
         self._icl_eps_at_level = 0
+        self._icl_steps_at_level = 0
 
         # ee_pose_ranges is [num_robots, 6, 2]: per DOF, [lo, hi] for the
         # uniform sample drawn at reset. The parent builds it once in __init__
@@ -55,6 +56,8 @@ class BimanualDirectICL(BimanualDirect):
     def _update_icl(self, success: torch.Tensor, done: torch.Tensor):
         if not self.cfg.use_icl:
             return
+        # Counted before any early return, so it accumulates unconditionally.
+        self._icl_steps_at_level += self.num_envs
         n_done = int(done.sum().item())
         if n_done == 0:
             return
@@ -62,15 +65,15 @@ class BimanualDirectICL(BimanualDirect):
         self._icl_eps_at_level += n_done
         self._icl_succ_count += int((success & done).sum().item())
 
-        # Forced promotion: guarantees the curriculum actually moves through
-        # its levels. See cfg.icl_force_promote_episodes.
         max_level = len(self.cfg.icl_range_scale) - 1
-        if self._icl_eps_at_level >= self.cfg.icl_force_promote_episodes and self.icl_level < max_level:
-            self.icl_level += 1
-            self._apply_icl_level()
-            self._icl_eps_at_level = 0
-            self._icl_ep_count = 0
-            self._icl_succ_count = 0
+
+        # Forced promotion: guarantees the curriculum actually traverses its
+        # levels even if the success threshold is never met. Counted in
+        # environment steps rather than episodes -- the episode-counted version
+        # (job 4228865) never fired despite ~660k completed episodes against a
+        # 20k threshold, and icl_level sat at 0 for 131M steps.
+        if self._icl_steps_at_level >= self.cfg.icl_force_promote_steps and self.icl_level < max_level:
+            self._set_level(self.icl_level + 1)
             return
 
         if self._icl_ep_count < self.cfg.icl_window:
@@ -78,13 +81,20 @@ class BimanualDirectICL(BimanualDirect):
 
         rate = self._icl_succ_count / max(self._icl_ep_count, 1)
         if rate >= self.cfg.icl_promote_rate and self.icl_level < max_level:
-            self.icl_level += 1
-            self._apply_icl_level()
-            self._icl_eps_at_level = 0
+            self._set_level(self.icl_level + 1)
         elif rate < self.cfg.icl_demote_rate and self.icl_level > 0:
-            self.icl_level -= 1
-            self._apply_icl_level()
-            self._icl_eps_at_level = 0
+            self._set_level(self.icl_level - 1)
+        else:
+            self._icl_ep_count = 0
+            self._icl_succ_count = 0
+
+    def _set_level(self, level: int):
+        '''Change level and reset every counter in one place, so a future edit
+        cannot leave one of them stale.'''
+        self.icl_level = level
+        self._apply_icl_level()
+        self._icl_eps_at_level = 0
+        self._icl_steps_at_level = 0
         self._icl_ep_count = 0
         self._icl_succ_count = 0
 
@@ -99,6 +109,8 @@ class BimanualDirectICL(BimanualDirect):
         if "log" not in self.extras:
             self.extras["log"] = dict()
         self.extras["log"]["metrics/icl_level"] = float(self.icl_level)
+        self.extras["log"]["metrics/icl_eps_at_level"] = float(self._icl_eps_at_level)
+        self.extras["log"]["metrics/icl_steps_at_level"] = float(self._icl_steps_at_level)
         self.extras["log"]["metrics/icl_scale"] = float(
             self.cfg.icl_range_scale[min(self.icl_level, len(self.cfg.icl_range_scale) - 1)]
         )

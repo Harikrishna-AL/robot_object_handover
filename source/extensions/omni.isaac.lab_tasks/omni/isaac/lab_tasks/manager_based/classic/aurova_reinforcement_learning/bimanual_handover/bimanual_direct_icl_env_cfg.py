@@ -54,11 +54,30 @@ class BimanualDirectICLCfg(BimanualDirectCfg):
     # the baseline's +1190. A threshold the task cannot reach is not a
     # curriculum.
     icl_promote_rate: float = 0.05
-    icl_demote_rate: float = 0.01
+    # DEMOTION DISABLED (0.0 means `rate < 0.0` is never true).
+    #
+    # Demotion was my addition, and it silently broke both ICL runs. On a task
+    # whose success rate sits near zero, `rate < demote_rate` is ALWAYS true,
+    # so every promotion is reversed ~200 episodes later and the level
+    # oscillates 0 -> 1 -> 0 forever. Verified by simulating the update rule:
+    # with forced promotion at 25M steps and demotion at 1%, the level returns
+    # to 0 within 200k steps of every promotion and never exceeds 1.
+    #
+    # That is why job 4211349 sat at level 0 for 290M steps and 4228865 for
+    # 131M. A reverse curriculum is meant to climb monotonically; re-enable
+    # this only once success rates are high enough for it to mean something.
+    icl_demote_rate: float = 0.0
 
     # Safety net so the curriculum traverses its levels even if the success
-    # threshold is still never reached. Without this the run silently
-    # degenerates into single-difficulty training again, which is exactly the
-    # failure 4211349 produced. Promote after this many completed episodes at
-    # one level regardless of success rate.
-    icl_force_promote_episodes: int = 20000
+    # threshold is never reached. Without it the run silently degenerates into
+    # single-difficulty training, which is what 4211349 produced.
+    #
+    # Counted in ENVIRONMENT STEPS, not episodes. The episode-counted version
+    # (job 4228865) never fired: at 131M steps with ~199-step episodes that is
+    # ~660k completed episodes against a threshold of 20k, so it should have
+    # maxed out the level ~30 times over, yet icl_level stayed 0. Rather than
+    # keep guessing at why the episode counter did not accumulate, this uses a
+    # counter incremented once per _get_dones call, which cannot be ambiguous.
+    # 25M steps/level traverses all 5 levels by ~100M, leaving the bulk of the
+    # 6e8 budget at full difficulty.
+    icl_force_promote_steps: int = 25_000_000
