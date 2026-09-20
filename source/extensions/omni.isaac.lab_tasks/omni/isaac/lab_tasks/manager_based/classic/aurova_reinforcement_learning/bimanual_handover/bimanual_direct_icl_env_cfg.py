@@ -8,28 +8,27 @@ from .bimanual_direct_env_cfg import BimanualDirectCfg
 Baseline task + inverse curriculum, as a SEPARATE task so BimanualDirectCfg /
 BimanualDirect stay byte-identical and the with/without comparison is clean.
 
-Purpose (2026-09-13): find out whether the curriculum helps at all, on a task
-that already learns. The self-play env could not answer this -- diagnostics
-there showed the receiving hand starts ~0.12m from the meeting point, of which
-~0.10m is just the length of the hand, so there was no approach distance left
-to curriculum over and all three implementations were no-ops. The baseline
-gives the receiving arm a real ~0.45m approach and a randomised object pose,
-so there is genuine difficulty to anneal.
+WHAT IS ANNEALED: the receiving arm's STARTING DISTANCE to the object.
+Level 0 starts it essentially on the object; the final level starts it at its
+normal home pose, i.e. the unmodified baseline.
 
-What is annealed: the SIZE of the holder's pose randomisation. The baseline
-samples the holder (and therefore the object) within +/-0.15m per axis and
-+/-0.3/0.6/0.3 rad. At level 0 that range collapses to a point, so every
-episode presents the object in the same place; the range then widens back to
-the full baseline range, which the last level reproduces exactly.
+WHAT IS NOT ANNEALED: the object's pose randomisation. It stays at the full
+baseline +/-0.15m / +/-0.3,0.6,0.3 rad at EVERY level.
 
-Naming honesty: this is an easy-to-hard curriculum over the initial-state
-DISTRIBUTION, not literally Florensa-style reverse curriculum (which starts
-from states adjacent to the goal and walks backwards). Doing the literal
-version needs the receiving arm placed near the object, which requires solving
-IK at reset -- attempted three times in the self-play env and never made to
-work (single differential step barely moved the arm; iterating it diverged
-because write_joint_state_to_sim does not refresh body_state_w). Scaling the
-sampling bounds needs no IK, no teleporting and no sim stepping.
+That distinction is the whole point, and the previous version got it backwards.
+It annealed the randomisation RANGE instead -- level 0 presented the object in
+exactly the same place every episode. That is not a reverse curriculum (it
+varies diversity, not distance to goal), and it failed catastrophically:
+job 4243150 ran the curriculum correctly through all five levels and still
+finished 540M steps at -21.5 reward with ZERO successes, against the plain
+baseline's +1190 and 0.3%. The mechanism was visible in `std`: it collapsed
+1.00 -> 0.121 within the first 25M steps while training on the zero-variability
+level, and never recovered (0.06 at 540M). Collapsing the initial-state
+distribution to a point removes everything there is to be uncertain about, the
+policy goes deterministic, and it cannot adapt when variety returns.
+
+Keeping the randomisation at full strength while shortening the reach is the
+formulation that should not have that failure mode.
 '''
 
 
@@ -38,46 +37,38 @@ class BimanualDirectICLCfg(BimanualDirectCfg):
 
     use_icl: bool = True
 
-    # Multiplier on ee_pose_incs per level. 0.0 = object always in the same
-    # place (easiest). The last entry MUST be 1.0 so the final level is the
-    # unmodified baseline and the run stays comparable to a no-ICL control.
-    icl_range_scale: list = [0.0, 0.25, 0.5, 0.75, 1.0]
+    # Receiver arm joint configuration that places its hand ON the object, for
+    # the object's NOMINAL pose. Solved offline (diag/solve_reach_pose.py, jobs
+    # 4267693/4267798) by iterating the differential IK controller with real sim
+    # steps between iterations, keeping the best iterate, and wrapping into
+    # [-pi, pi].
+    #
+    # Verified, not assumed: this configuration was written back to the sim and
+    # re-measured at 0.0548 m from the object (vs 0.4203 m at the home pose),
+    # and checked to lie inside the joint limits. The other candidate solve
+    # looked better raw (0.0306 m) but degraded to 0.6166 m when wrapped --
+    # its out-of-limit values (7.5, -13.0 rad) were being clamped by PhysX on
+    # write, so its reported distance never corresponded to those numbers.
+    icl_near_object_arm_q: list = [
+        -0.434602, 0.892648, -0.445363, -0.752578, -0.047977, 0.975372, 1.504364
+    ]
 
-    # Pooled promote/demote over a rolling window of completed episodes.
-    # Demotion included deliberately: it lets a run that over-promotes recover
-    # instead of flatlining, which is how every previous run failed.
+    # Fraction of the way from the home pose to the on-object configuration, per
+    # level. 1.0 = start on the object (easiest). The last entry MUST be 0.0 so
+    # the final level is the unmodified baseline and stays comparable to a
+    # no-ICL control.
+    icl_reach_frac: list = [1.0, 0.75, 0.5, 0.25, 0.0]
+
+    # Promotion on a rolling window of completed episodes, plus a step-based
+    # safety net so the curriculum traverses its levels even if the success
+    # threshold is never reached.
     icl_window: int = 200
-    # Lowered 0.60 -> 0.05 (2026-09-16). At 0.60 the curriculum never advanced:
-    # job 4211349 spent all 290M steps pinned at level 0 while the baseline
-    # reached only 0.3% success, so the "curriculum" was really just a fixed
-    # easiest setting -- and it scored -29 reward with ZERO successes against
-    # the baseline's +1190. A threshold the task cannot reach is not a
-    # curriculum.
     icl_promote_rate: float = 0.05
-    # DEMOTION DISABLED (0.0 means `rate < 0.0` is never true).
-    #
-    # Demotion was my addition, and it silently broke both ICL runs. On a task
-    # whose success rate sits near zero, `rate < demote_rate` is ALWAYS true,
-    # so every promotion is reversed ~200 episodes later and the level
-    # oscillates 0 -> 1 -> 0 forever. Verified by simulating the update rule:
-    # with forced promotion at 25M steps and demotion at 1%, the level returns
-    # to 0 within 200k steps of every promotion and never exceeds 1.
-    #
-    # That is why job 4211349 sat at level 0 for 290M steps and 4228865 for
-    # 131M. A reverse curriculum is meant to climb monotonically; re-enable
-    # this only once success rates are high enough for it to mean something.
-    icl_demote_rate: float = 0.0
-
-    # Safety net so the curriculum traverses its levels even if the success
-    # threshold is never reached. Without it the run silently degenerates into
-    # single-difficulty training, which is what 4211349 produced.
-    #
-    # Counted in ENVIRONMENT STEPS, not episodes. The episode-counted version
-    # (job 4228865) never fired: at 131M steps with ~199-step episodes that is
-    # ~660k completed episodes against a threshold of 20k, so it should have
-    # maxed out the level ~30 times over, yet icl_level stayed 0. Rather than
-    # keep guessing at why the episode counter did not accumulate, this uses a
-    # counter incremented once per _get_dones call, which cannot be ambiguous.
-    # 25M steps/level traverses all 5 levels by ~100M, leaving the bulk of the
-    # 6e8 budget at full difficulty.
     icl_force_promote_steps: int = 25_000_000
+
+    # DEMOTION DISABLED (0.0 means `rate < 0.0` is never true). On a task whose
+    # success rate is near zero, a success-gated demotion fires unconditionally
+    # and reverses every promotion ~200 episodes later -- verified by simulating
+    # the update rule, which oscillated 0 -> 1 -> 0 indefinitely. That is why
+    # jobs 4211349 and 4228865 never left level 0.
+    icl_demote_rate: float = 0.0
