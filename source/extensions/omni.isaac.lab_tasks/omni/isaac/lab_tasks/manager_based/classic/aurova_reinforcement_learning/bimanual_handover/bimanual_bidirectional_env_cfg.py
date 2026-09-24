@@ -66,6 +66,29 @@ assert not any(name.startswith("hand_") for name in _GEN3_ARM_LINK_NAMES)
 assert len(_GEN3_ARM_LINK_NAMES) == 9
 
 
+# Closed-grip hand pose, copied verbatim from UR5e_4f_CFG's init_state in
+# robots_cfg.py -- the pose the BASELINE's holder uses to keep hold of the
+# object for a whole episode.
+#
+# Diagnosed 2026-09-24: the two robot configs have OPPOSITE hand defaults.
+# UR5e_4f_CFG curls three fingers plus the thumb (0.263*6 / *5 / *2.3), i.e. a
+# closed grip. GEN3_4f_CFG sets only "joint_12_0": 0.263 (the thumb's zero) and
+# is otherwise OPEN. Self-play replaced the UR5e with a GEN3 clone for the
+# giving slot and carried over the arm but NOT the grip, so the giver has been
+# presenting the object with an open hand in every run -- the object was never
+# actually held. That is why it sank ~2.2mm/step with the arms motionless, and
+# why the kinematic weld had to exist at all.
+#
+# Both arms carry the same 16-DOF hand (identical joint_0_0..joint_15_0 names),
+# so these values transfer directly.
+_CLOSED_HAND_JOINTS = {
+    "joint_0_0": 0.0,    "joint_1_0": 0.263 * 6,  "joint_2_0": 0.263 * 5,  "joint_3_0": 0.263 * 2.3,
+    "joint_4_0": 0.0,    "joint_5_0": 0.263 * 6,  "joint_6_0": 0.263 * 5,  "joint_7_0": 0.263 * 2.3,
+    "joint_8_0": 0.0,    "joint_9_0": 0.263 * 6,  "joint_10_0": 0.263 * 5, "joint_11_0": 0.263 * 2.3,
+    "joint_12_0": 0.263, "joint_13_0": 0.0,       "joint_14_0": 0.263 * 5, "joint_15_0": 0.263 * 5,
+}
+
+
 @configclass
 class BimanualBidirectionalCfg(BimanualDirectCfg):
 
@@ -175,7 +198,13 @@ class BimanualBidirectionalCfg(BimanualDirectCfg):
         spawn=GEN3_4f_CFG.spawn.replace(
             usd_path=GEN3_4f_CFG.spawn.usd_path.replace("gen3_4f.usd", "gen3_4f_arm2.usd"),
         ),
-        init_state=GEN3_4f_CFG.init_state.replace(pos=(-0.65, 0.0, 0.0), rot=(0.0, 0.0, 0.0, 1.0)),  # rotated 180deg about z to face GEN3. Separation 0.60m (GEN3 base -1.25, this arm -0.65). Reverted from 0.80m for Run A: 0.80m is confounded with the phase1_fraction 4.7-14% -> 0 regression, and 0.60m has a known-good baseline. Note the 'both reach the same point' worry that motivated 0.80m was based on the reset IK target (0.30m), NOT the reach limit -- and the measured hand separation never fell below 0.43m anyway, so contention was never the binding constraint.
+        init_state=GEN3_4f_CFG.init_state.replace(
+            pos=(-0.65, 0.0, 0.0), rot=(0.0, 0.0, 0.0, 1.0),
+            # Start the GIVING hand closed around the object (see
+            # _CLOSED_HAND_JOINTS). Without this the giver presents the object
+            # with an open palm and it is not held at all.
+            joint_pos={**GEN3_4f_CFG.init_state.joint_pos, **_CLOSED_HAND_JOINTS},
+        ),  # rotated 180deg about z to face GEN3. Separation 0.60m (GEN3 base -1.25, this arm -0.65). Reverted from 0.80m for Run A: 0.80m is confounded with the phase1_fraction 4.7-14% -> 0 regression, and 0.60m has a known-good baseline. Note the 'both reach the same point' worry that motivated 0.80m was based on the reset IK target (0.30m), NOT the reach limit -- and the measured hand separation never fell below 0.43m anyway, so contention was never the binding constraint.
     )
     # Both slots hold GEN3 hardware, so BOTH entries must use GEN3 link names.
     # Diagnosed 2026-08-15: this inherited BimanualDirectCfg.links unchanged,
@@ -259,6 +288,13 @@ class BimanualBidirectionalCfg(BimanualDirectCfg):
     # requires that condition to hold for several consecutive steps before
     # latching new_receiver_grasped, since a one-off force spike from a fast
     # bump is still not the same thing as a held grasp.
+    # Kinematic weld of the object to the current holder. Retained only as a
+    # fallback: with _CLOSED_HAND_JOINTS the giver now holds the object with a
+    # real grip, which is what makes "receiver still holds it after the giver
+    # lets go" a meaningful test. While the weld is on, stage 3 -> 4 converts
+    # 12/12 because the object physically cannot fall.
+    use_object_weld: bool = True
+
     use_force_rewards: bool = True
     grasp_sustain_steps: int = 3
 

@@ -113,6 +113,13 @@ class BimanualBidirectional(BimanualDirect):
         # call is safe if the order ever changes.
         self._last_truncated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
+        # Closed-grip hand pose for the GIVER, taken from the articulation's own
+        # default joint positions -- the same source BimanualDirect uses for its
+        # holder. robot_cfg_1 now bakes _CLOSED_HAND_JOINTS into its init_state,
+        # so this reads back a real grip rather than an open palm.
+        _giver = self.cfg.UR5e
+        self.closed_hand_joints = self.default_joint_pos[_giver][:, len(self.cfg.joints[_giver]):].clone()
+
         # --- Reverse curriculum state (2026-09-10) -------------------------
         # One global level shared by all envs (not per-env): promotion is
         # decided from a pooled success rate, so a per-env level would just
@@ -312,6 +319,9 @@ class BimanualBidirectional(BimanualDirect):
         makes a still-imperfect detection harmless -- the object just
         kinematically follows the "wrong" hand -- rather than catastrophic.
         '''
+        if not self.cfg.use_object_weld:
+            return
+
         # Single-transfer staging (2026-08-15): UR5e holds until the receiver
         # has a sustained grasp (stage >= 3), GEN3 holds from then on.
         gen3_is_holder = self.stage >= 3
@@ -362,6 +372,14 @@ class BimanualBidirectional(BimanualDirect):
         last 16 columns of self.actions[idx] regardless of arm DOF (6 for
         UR5e, 7 for GEN3), so -16: is used rather than a fixed offset.
         '''
+        # Hold a real grip until the receiver has taken the object. Without this
+        # the giver's 16 hand joints come straight from the policy, which is
+        # random early in training, so it opens its hand immediately and the
+        # object is never held -- the reason the kinematic weld was needed.
+        hold = self.stage < 3
+        if torch.any(hold):
+            self.actions[self.cfg.UR5e][hold, -16:] = self.closed_hand_joints[hold]
+
         release = self.stage >= 3
         self.actions[self.cfg.UR5e][release, -16:] = self.open_hand_joints
 
