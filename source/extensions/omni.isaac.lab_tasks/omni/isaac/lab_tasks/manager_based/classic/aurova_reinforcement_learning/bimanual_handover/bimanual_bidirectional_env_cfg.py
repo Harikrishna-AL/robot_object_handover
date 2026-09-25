@@ -293,7 +293,16 @@ class BimanualBidirectionalCfg(BimanualDirectCfg):
     # real grip, which is what makes "receiver still holds it after the giver
     # lets go" a meaningful test. While the weld is on, stage 3 -> 4 converts
     # 12/12 because the object physically cannot fall.
-    use_object_weld: bool = True
+    # DEFAULT FLIPPED TO FALSE 2026-09-25, verified by job 4288117: with the
+    # giver's hand actually closed, the object holds with the weld OFF -- it
+    # drops 6mm over 300 steps with both arms commanded still (it used to sink
+    # 242mm in 111 steps), and the giver registers real contact force of ~5.25
+    # where it previously read exactly 0.0.
+    #
+    # This is what makes "receiver still holds it after the giver lets go" a
+    # real test. With the weld on, stage 3 -> 4 converted 12/12 because the
+    # object could not physically fall.
+    use_object_weld: bool = False
 
     use_force_rewards: bool = True
     grasp_sustain_steps: int = 3
