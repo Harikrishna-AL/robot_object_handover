@@ -85,7 +85,23 @@ _CLOSED_HAND_JOINTS = {
     "joint_0_0": 0.0,    "joint_1_0": 0.263 * 6,  "joint_2_0": 0.263 * 5,  "joint_3_0": 0.263 * 2.3,
     "joint_4_0": 0.0,    "joint_5_0": 0.263 * 6,  "joint_6_0": 0.263 * 5,  "joint_7_0": 0.263 * 2.3,
     "joint_8_0": 0.0,    "joint_9_0": 0.263 * 6,  "joint_10_0": 0.263 * 5, "joint_11_0": 0.263 * 2.3,
-    "joint_12_0": 0.263, "joint_13_0": 0.0,       "joint_14_0": 0.263 * 5, "joint_15_0": 0.263 * 5,
+    # joint_14_0 is NOT 0.263*5 like its neighbours. That value came straight
+    # from UR5e_4f's config (robots_cfg.py:84), where the hand is a different
+    # USD; on gen3_4f_arm2.usd this joint's range is roughly [-0.189, 0.800], so
+    # 1.315 was out of it. IsaacLab's Articulation._validate_cfg raised
+    # "joint_14_0: 1.315 not in [-0.189, 0.800]" on every startup -- and because
+    # that raise happens inside an initialize CALLBACK, the exception was logged
+    # and swallowed rather than stopping the run, so it sat unnoticed in the grip
+    # verification (job 4288117) and in both self-play runs (4292718/19). PhysX
+    # clamped the target to the limit anyway, which is why the grip still held.
+    #
+    # 0.79, not 0.80: _validate_cfg compares strictly (articulation.py:1260,
+    # `default_joint_pos > joint_pos_limits[:, 1]`) and formats the limit to 3
+    # decimals, so the printed 0.800 is a rounded value slightly BELOW 0.8 --
+    # setting exactly 0.800 still failed (job 4292982, "0.800 not in [-0.189,
+    # 0.800]"). A small margin keeps it inside whatever the true bound is; 0.01
+    # rad on a thumb joint is ~0.6 degrees. Re-verified by job 4293464.
+    "joint_12_0": 0.263, "joint_13_0": 0.0,       "joint_14_0": 0.79,      "joint_15_0": 0.263 * 5,
 }
 
 
