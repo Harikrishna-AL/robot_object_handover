@@ -120,6 +120,34 @@ class BimanualBidirectional(BimanualDirect):
         _giver = self.cfg.UR5e
         self.closed_hand_joints = self.default_joint_pos[_giver][:, len(self.cfg.joints[_giver]):].clone()
 
+        # --- Per-episode giver/taker assignment (2026-09-25) ---------------
+        # Until now the giver was ALWAYS the arm in the UR5e slot. The +/-1
+        # context scalar in the observation was therefore perfectly correlated
+        # with which half of the observation vector an arm occupied, so it
+        # carried no information the policy could not already read off the slot
+        # -- the "one shared policy, told apart by a context scalar" hypothesis
+        # was never actually under test. Sampling the giver per episode makes
+        # the scalar the only thing that says which job an arm has, and forces
+        # the same weights to produce both behaviours.
+        #
+        # cfg.randomize_giver False reproduces the old fixed assignment exactly
+        # (giver_is_gen3 stays all-False, and every role-dependent expression
+        # below reduces to its previous form).
+        self.giver_is_gen3 = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        # --- True per-EPISODE success rate (2026-09-25) --------------------
+        # metrics/success_rate used to be transfer_complete.mean() over the
+        # CURRENT STEP -- an instantaneous fraction of envs sitting in stage 4,
+        # not a success rate. Because stage 4 terminates the episode, an env
+        # occupies it for exactly one step out of ~200, so the logged number
+        # understated the real per-episode rate by roughly the episode length:
+        # the 48h baseline logged 0.3% while 3 of 13 rendered episodes (23%)
+        # actually completed the handover. Counted properly here, over a window
+        # of completed episodes.
+        self._succ_window_eps = 0
+        self._succ_window_hits = 0
+        self._succ_rate_per_episode = 0.0
+
         # --- Reverse curriculum state (2026-09-10) -------------------------
         # One global level shared by all envs (not per-env): promotion is
         # decided from a pooled success rate, so a per-env level would just
@@ -286,8 +314,12 @@ class BimanualBidirectional(BimanualDirect):
         '''
         if not self.cfg.stage_gate_arms:
             return
-        self._freeze_pose_increment(actions_gen3, self.stage == 0)
-        self._freeze_pose_increment(actions_ur5e, self.stage >= 1)
+        # Which ARM is frozen now depends on which one is giving this episode.
+        wait = self.stage == 0    # the receiver waits while the giver presents
+        park = self.stage >= 1    # the giver parks once it has presented
+        ur5e_is_giver, gen3_is_giver = self._giver_masks()
+        self._freeze_pose_increment(actions_ur5e, torch.where(ur5e_is_giver, park, wait))
+        self._freeze_pose_increment(actions_gen3, torch.where(gen3_is_giver, park, wait))
 
     def _weld_object_to_current_holder(self):
         '''
@@ -322,9 +354,12 @@ class BimanualBidirectional(BimanualDirect):
         if not self.cfg.use_object_weld:
             return
 
-        # Single-transfer staging (2026-08-15): UR5e holds until the receiver
-        # has a sustained grasp (stage >= 3), GEN3 holds from then on.
-        gen3_is_holder = self.stage >= 3
+        # Single-transfer staging (2026-08-15): the GIVER holds until the
+        # receiver has a sustained grasp (stage >= 3), the receiver holds from
+        # then on. With a per-episode giver (2026-09-25) that is the XOR of
+        # "GEN3 is the giver" and "the handover has happened" -- which reduces
+        # to `stage >= 3` when UR5e always gives.
+        gen3_is_holder = torch.logical_xor(self.giver_is_gen3, self.stage >= 3)
 
         for idx, holder_mask in (
             (self.cfg.UR5e, torch.logical_not(gen3_is_holder)),
@@ -376,12 +411,18 @@ class BimanualBidirectional(BimanualDirect):
         # the giver's 16 hand joints come straight from the policy, which is
         # random early in training, so it opens its hand immediately and the
         # object is never held -- the reason the kinematic weld was needed.
-        hold = self.stage < 3
-        if torch.any(hold):
-            self.actions[self.cfg.UR5e][hold, -16:] = self.closed_hand_joints[hold]
-
-        release = self.stage >= 3
-        self.actions[self.cfg.UR5e][release, -16:] = self.open_hand_joints
+        # Applied to whichever arm is giving this episode. closed_hand_joints
+        # was read off the UR5e slot's defaults, but it is a joint-position
+        # COMMAND and both arms are the same 16-DOF hand, so the same vector is
+        # the correct closed pose for either.
+        before, after = self.stage < 3, self.stage >= 3
+        for idx, is_giver in zip((self.cfg.UR5e, self.cfg.GEN3), self._giver_masks()):
+            hold = torch.logical_and(is_giver, before)
+            if torch.any(hold):
+                self.actions[idx][hold, -16:] = self.closed_hand_joints[hold]
+            release = torch.logical_and(is_giver, after)
+            if torch.any(release):
+                self.actions[idx][release, -16:] = self.open_hand_joints
 
     def _apply_action(self) -> None:
         self.scene.articulations[self.cfg.keys[self.cfg.UR5e]].set_joint_position_target(
@@ -440,6 +481,25 @@ class BimanualBidirectional(BimanualDirect):
             )
             self.grasp_point_obj_pose_r[idx] = torch.cat((grasp_point_obj_pos_r, grasp_point_obj_quat_r), dim=-1)
 
+    # ------------------------------------------------------------------
+    # Role selection. Both arms are identical GEN3 hardware, so every
+    # role-dependent quantity is computed for BOTH arms and then selected per
+    # env, rather than indexing one articulation by a per-env role. That keeps
+    # each formula byte-identical to the fixed-role version, so the randomised
+    # task provably reduces to the old one when giver_is_gen3 is all-False.
+    def _pick_by_role(self, value_ur5e: torch.Tensor, value_gen3: torch.Tensor):
+        '''(giver_value, receiver_value) per env, from the two arms' values.'''
+        mask = self.giver_is_gen3
+        while mask.dim() < value_ur5e.dim():
+            mask = mask.unsqueeze(-1)
+        giver = torch.where(mask, value_gen3, value_ur5e)
+        receiver = torch.where(mask, value_ur5e, value_gen3)
+        return giver, receiver
+
+    def _giver_masks(self):
+        '''(ur5e_is_giver, gen3_is_giver) boolean masks, in cfg.keys order.'''
+        return torch.logical_not(self.giver_is_gen3), self.giver_is_gen3
+
     def _selected_hand_joint(self, idx: int) -> torch.Tensor:
         hand_joint_pos = self.scene.articulations[self.cfg.keys[idx]].data.joint_pos[:, self._hand_joints_idx[idx]]
         sel = torch.round(
@@ -466,9 +526,14 @@ class BimanualBidirectional(BimanualDirect):
         # single transfer (2026-08-15) GEN3 is the receiver until it has the
         # object (stage >= 3), after which the roles flip -- so the scalar is
         # still the thing that tells the shared policy which arm it is driving.
-        gen3_has_object = (self.stage >= 3).float()
-        role_ur5e = (2.0 * gen3_has_object - 1.0).unsqueeze(-1)
-        role_gen3 = (1.0 - 2.0 * gen3_has_object).unsqueeze(-1)
+        # 2026-09-25: which arm receives is now sampled per episode, so this
+        # scalar finally carries information. +1 = "you must TAKE the object",
+        # -1 = "you are holding it and must give it away". It still flips once
+        # the handover has happened (stage >= 3), as before.
+        handed_over = self.stage >= 3
+        gen3_receiving = torch.logical_xor(torch.logical_not(self.giver_is_gen3), handed_over)
+        role_gen3 = (2.0 * gen3_receiving.float() - 1.0).unsqueeze(-1)
+        role_ur5e = -role_gen3
 
         ur5e_block = torch.cat((
             self.rot_ee_pose_r[self.cfg.UR5e],
@@ -821,12 +886,16 @@ class BimanualBidirectional(BimanualDirect):
         # and force_drop are IDENTICALLY ZERO and signal_instability has never
         # contributed anything in any run, in this env or the baseline.
         arm_contact_matrix = self.cfg.contact_matrix[self._ur5e_contact_slice]  # identical to the gen3 segment by construction
-        holder_idx, receiver_idx = cfg.UR5e, cfg.GEN3
-
         obj = self.scene.rigid_objects["object"].data.body_state_w[:, 0, :3]
-        tips_receiver = self.scene.articulations[cfg.keys[receiver_idx]].data.body_state_w[
-            :, self.finger_tips[receiver_idx], 0:7
+
+        # Per-env roles (2026-09-25): compute both arms' quantities, select.
+        tips_ur5e = self.scene.articulations[cfg.keys[cfg.UR5e]].data.body_state_w[
+            :, self.finger_tips[cfg.UR5e], 0:7
         ].mean(1)[:, :3]
+        tips_gen3 = self.scene.articulations[cfg.keys[cfg.GEN3]].data.body_state_w[
+            :, self.finger_tips[cfg.GEN3], 0:7
+        ].mean(1)[:, :3]
+        _, tips_receiver = self._pick_by_role(tips_ur5e, tips_gen3)
 
         # Both in metres, Euclidean. Deliberately NOT dual_quaternion_error:
         # index 0 of that blends position and rotation and was minimisable by
@@ -834,7 +903,10 @@ class BimanualBidirectional(BimanualDirect):
         present_dist = torch.norm(obj - self.handoff_pos, dim=-1)
         reach_dist = torch.norm(tips_receiver - obj, dim=-1)
 
-        touch_receiver, grasp_receiver = self._grasp_flags(receiver_idx, arm_contact_matrix)
+        touch_ur5e, grasp_ur5e = self._grasp_flags(cfg.UR5e, arm_contact_matrix)
+        touch_gen3, grasp_gen3 = self._grasp_flags(cfg.GEN3, arm_contact_matrix)
+        _, touch_receiver = self._pick_by_role(touch_ur5e, touch_gen3)
+        _, grasp_receiver = self._pick_by_role(grasp_ur5e, grasp_gen3)
         stage = self.stage
 
         # ---- stage transitions (one-way ratchet) -------------------------
@@ -893,9 +965,13 @@ class BimanualBidirectional(BimanualDirect):
         # WITH the freeze active, because zeroing the Cartesian increment does
         # not zero the arm's residual settling velocity. That was a constant
         # unavoidable drain the policy could only escape by ending the episode.
-        holder_speed = torch.norm(
-            self.scene.articulations[cfg.keys[holder_idx]].data.body_state_w[:, self.ee_jacobi_idx[holder_idx] + 1, 7:], dim=-1
+        speed_ur5e = torch.norm(
+            self.scene.articulations[cfg.keys[cfg.UR5e]].data.body_state_w[:, self.ee_jacobi_idx[cfg.UR5e] + 1, 7:], dim=-1
         )
+        speed_gen3 = torch.norm(
+            self.scene.articulations[cfg.keys[cfg.GEN3]].data.body_state_w[:, self.ee_jacobi_idx[cfg.GEN3] + 1, 7:], dim=-1
+        )
+        holder_speed, _ = self._pick_by_role(speed_ur5e, speed_gen3)
         holder_still_penalty = cfg.lambda_holder_still * holder_speed * receiver_active.float()
         reward = reward - holder_still_penalty
 
@@ -916,7 +992,16 @@ class BimanualBidirectional(BimanualDirect):
         reward = reward - cfg.lambda_arm_collision * arm_arm_contact
 
         # ---- force reward signals (carried over from the baseline) --------
-        force_reward, force_log = self._force_signal_rewards(receiver_idx, holder_idx, arm_contact_matrix)
+        # Computed for both orientations and selected per env: the force terms
+        # read the RECEIVER's contact slice (force_excess spans both arms
+        # either way, so it is identical between the two calls).
+        fr_gen3_recv, log_gen3_recv = self._force_signal_rewards(cfg.GEN3, cfg.UR5e, arm_contact_matrix)
+        fr_ur5e_recv, log_ur5e_recv = self._force_signal_rewards(cfg.UR5e, cfg.GEN3, arm_contact_matrix)
+        force_reward = torch.where(self.giver_is_gen3, fr_ur5e_recv, fr_gen3_recv)
+        force_log = {
+            key: torch.where(self.giver_is_gen3, log_ur5e_recv[key], value)
+            for key, value in log_gen3_recv.items()
+        }
         reward = reward + force_reward
 
         self.transfer_complete = self.stage >= 4
@@ -932,7 +1017,12 @@ class BimanualBidirectional(BimanualDirect):
         log["metrics/present_dist"] = present_dist.mean().item()
         log["metrics/hand_obj_dist"] = reach_dist.mean().item()
         log["metrics/arm_arm_collision"] = arm_arm_contact.mean().item()
-        log["metrics/success_rate"] = self.transfer_complete.float().mean().item()
+        # Renamed 2026-09-25: this is the fraction of envs in stage 4 RIGHT
+        # NOW, not a success rate. The real per-episode rate is logged from
+        # _get_dones as metrics/success_rate_per_episode.
+        log["metrics/success_rate_per_step"] = self.transfer_complete.float().mean().item()
+        # Self-check that the randomisation is actually happening and balanced.
+        log["metrics/giver_is_gen3_frac"] = self.giver_is_gen3.float().mean().item()
         log["reward_terms/shaping_present"] = (cfg.w_present * d_present * holder_active.float()).mean().item()
         log["reward_terms/shaping_reach"] = (cfg.w_reach * d_reach * receiver_active.float()).mean().item()
         log["reward_terms/holder_still_penalty"] = holder_still_penalty.mean().item()
@@ -1069,7 +1159,21 @@ class BimanualBidirectional(BimanualDirect):
         self.extras["log"]["metrics/trunc_object_falling"] = object_falling.float().mean().item()
         self.extras["log"]["metrics/trunc_any"] = truncated.float().mean().item()
 
-        self._update_curriculum(success, torch.logical_or(truncated, terminated))
+        # True per-episode success rate over a window of COMPLETED episodes --
+        # see the counters' comment in __init__ for why the per-step version
+        # was off by roughly the episode length.
+        episode_done = torch.logical_or(truncated, terminated)
+        n_done = int(episode_done.sum().item())
+        if n_done:
+            self._succ_window_eps += n_done
+            self._succ_window_hits += int((success & episode_done).sum().item())
+            if self._succ_window_eps >= self.cfg.success_window:
+                self._succ_rate_per_episode = self._succ_window_hits / self._succ_window_eps
+                self._succ_window_eps = 0
+                self._succ_window_hits = 0
+        self.extras["log"]["metrics/success_rate_per_episode"] = self._succ_rate_per_episode
+
+        self._update_curriculum(success, episode_done)
         self.extras["log"]["metrics/curriculum_level"] = float(self.curriculum_level)
         self.extras["log"]["metrics/curriculum_start_frac"] = float(
             self.cfg.curriculum_start_frac[min(self.curriculum_level, len(self.cfg.curriculum_start_frac) - 1)]
@@ -1085,6 +1189,8 @@ class BimanualBidirectional(BimanualDirect):
         # since self.num_contacts is computed generically from
         # len(cfg.contact_sensors_dict) in BimanualDirect.__init__).
         super()._reset_idx(env_ids)
+
+        self._assign_roles(env_ids)
 
         self.phase[env_ids] = 0
         self.ur5e_grasped[env_ids] = False
@@ -1121,6 +1227,74 @@ class BimanualBidirectional(BimanualDirect):
 
         self._apply_curriculum_reset(env_ids)
 
+    def _assign_roles(self, env_ids: Sequence[int]):
+        '''
+        Sample which arm gives this episode, then make the world agree with it:
+        the giver starts with a closed grip on the object, the receiver with an
+        open hand, and the object sits in the GIVER's hand.
+
+        The parent's _reset_idx always places the object at UR5e's end effector
+        (bimanual_direct_env.py:930), which is only right for the half of the
+        batch where UR5e is giving -- so the object is re-placed here for every
+        reset env using the chosen giver's end effector. Both arms are the same
+        GEN3 hardware, so cfg.obj_pos_trans/obj_quat_trans (the end-effector ->
+        object offset) is valid for either, as _weld_object_to_current_holder
+        already relies on.
+
+        The hand joint states matter just as much: robot_cfg_1 bakes
+        _CLOSED_HAND_JOINTS into its init_state but robot_cfg_2 does not, so
+        without this the GEN3-gives half of the batch would start with the
+        object resting in an open palm -- exactly the failure the closed-grip
+        fix was for (measured 242mm of free fall in 111 steps).
+        '''
+        cfg = self.cfg
+        if cfg.randomize_giver:
+            self.giver_is_gen3[env_ids] = torch.rand(len(env_ids), device=self.device) < 0.5
+        else:
+            self.giver_is_gen3[env_ids] = False
+
+        # --- hand joint states: giver closed, receiver open ---------------
+        open_q = self.open_hand_joints.expand(self.num_envs, -1)
+        for idx, is_giver in zip((cfg.UR5e, cfg.GEN3), self._giver_masks()):
+            hand_q = torch.where(is_giver.unsqueeze(-1), self.closed_hand_joints, open_q)
+            art = self.scene.articulations[cfg.keys[idx]]
+            art.write_joint_state_to_sim(
+                hand_q[env_ids],
+                torch.zeros_like(hand_q[env_ids]),
+                self._hand_joints_idx[idx],
+                env_ids,
+            )
+            # Keep the running IK/action targets consistent, or the first
+            # perform_increment drives the hand straight back to its default.
+            self.reset_joint_positions[idx][env_ids, -16:] = hand_q[env_ids]
+            self.actions[idx][env_ids, -16:] = hand_q[env_ids]
+
+        # --- object into the giver's hand ---------------------------------
+        ee_ur5e = self.scene.articulations[cfg.keys[cfg.UR5e]].data.body_state_w[
+            env_ids, self.ee_jacobi_idx[cfg.UR5e] + 1, 0:7
+        ]
+        ee_gen3 = self.scene.articulations[cfg.keys[cfg.GEN3]].data.body_state_w[
+            env_ids, self.ee_jacobi_idx[cfg.GEN3] + 1, 0:7
+        ]
+        ee_giver = torch.where(self.giver_is_gen3[env_ids].unsqueeze(-1), ee_gen3, ee_ur5e)
+        obj_pos, obj_quat = combine_frame_transforms(
+            t01=ee_giver[:, :3], q01=ee_giver[:, 3:],
+            t12=cfg.obj_pos_trans[env_ids], q12=cfg.obj_quat_trans[env_ids],
+        )
+        obj_handle = self.scene.rigid_objects["object"]
+        obj_handle.write_root_pose_to_sim(
+            root_pose=torch.cat((obj_pos, obj_quat), dim=-1), env_ids=env_ids
+        )
+        # Without zeroing velocity the object keeps whatever it had before the
+        # reset and is dragged out of the hand on the next substep -- the same
+        # bug that made ep_len_mean collapse to 1 in runs 3908542/3908543.
+        obj_handle.write_root_velocity_to_sim(
+            root_velocity=torch.zeros((len(env_ids), 6), device=self.device), env_ids=env_ids
+        )
+        # The parent cached the object's pose relative to each arm BEFORE this
+        # move, so refresh it.
+        self.update_new_poses()
+
     def _apply_curriculum_reset(self, env_ids: Sequence[int]):
         '''
         Reverse curriculum, implemented by moving the HANDOFF POINT rather than
@@ -1151,10 +1325,13 @@ class BimanualBidirectional(BimanualDirect):
         if frac <= 0.0:
             return  # hardest level == the unmodified task
 
-        receiver = cfg.GEN3
-        ee_receiver = self.scene.articulations[cfg.keys[receiver]].data.body_state_w[
-            :, self.ee_jacobi_idx[receiver] + 1, 0:3
+        ee_ur5e = self.scene.articulations[cfg.keys[cfg.UR5e]].data.body_state_w[
+            :, self.ee_jacobi_idx[cfg.UR5e] + 1, 0:3
         ]
+        ee_gen3 = self.scene.articulations[cfg.keys[cfg.GEN3]].data.body_state_w[
+            :, self.ee_jacobi_idx[cfg.GEN3] + 1, 0:3
+        ]
+        _, ee_receiver = self._pick_by_role(ee_ur5e, ee_gen3)
         # handoff_pos was just set to the midpoint by _reset_idx; slide it
         # toward the receiver's hand by `frac`.
         midpoint = self.handoff_pos

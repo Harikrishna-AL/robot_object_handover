@@ -302,6 +302,14 @@ class BimanualBidirectionalCfg(BimanualDirectCfg):
     # This is what makes "receiver still holds it after the giver lets go" a
     # real test. With the weld on, stage 3 -> 4 converted 12/12 because the
     # object could not physically fall.
+    # Sample which arm gives, per episode (2026-09-25). False reproduces the
+    # old fixed assignment (the arm in the UR5e slot always gives), under which
+    # the +/-1 context scalar was perfectly predictable from the observation
+    # slot and so carried no information -- see BimanualBidirectional.__init__.
+    randomize_giver: bool = True
+    # Completed episodes per window for metrics/success_rate_per_episode.
+    success_window: int = 500
+
     use_object_weld: bool = False
 
     use_force_rewards: bool = True
