@@ -37,15 +37,32 @@ changing anything else.
 
 Job 4211348, 1024 envs, no video, single GPU:
 
-| steps | `ep_rew_mean` | `success_rate` |
-|------:|--------------:|---------------:|
-|    5M |            −8 |              0 |
-|   11M |           +10 |         1.4e-4 |
-|   50M |          +146 |         5.4e-4 |
-|  150M |         +1050 |         2.9e-3 |
-|  300M |         +1190 |         3.2e-3 |
+| steps | `ep_rew_mean` | `success_rate` (per step) |
+|------:|--------------:|--------------------------:|
+|    5M |            −8 |                         0 |
+|   11M |           +10 |                    1.4e-4 |
+|   50M |          +146 |                    5.4e-4 |
+|  150M |         +1050 |                    2.9e-3 |
+|  300M |         +1190 |                    3.2e-3 |
 
 Still climbing when the 24h wall clock stopped it, at half the intended budget.
+
+### `success_rate` is NOT a success rate — read this before quoting it
+
+The logged `metrics/success_rate` is `obj_reached_target.mean()` over the
+**current step**: the fraction of environments sitting in the success state at
+that instant. Reaching that state ends the episode, so an environment occupies
+it for about one step out of ~200 — which divides the number you want by roughly
+the episode length.
+
+Measured on this same run's final checkpoint, over 13 rendered episodes:
+**3 completed the handover, i.e. ~23%**, against a logged 3.2e-3 (0.3%). Off by
+about 80x.
+
+So: `success_rate` is fine as a *relative* progress signal between checkpoints of
+the same run, and useless as an absolute number. To state a real success rate,
+count completed episodes — `render_random_policy.py` prints a per-episode outcome
+histogram for exactly this purpose. Do not put the logged figure in a report.
 
 The curve is **not monotonic** — it has multi-checkpoint dips (e.g. 205 → 140 →
 279, and 30.8 → 26.9 → 59.5) that look like plateaus but are troughs. Judge
