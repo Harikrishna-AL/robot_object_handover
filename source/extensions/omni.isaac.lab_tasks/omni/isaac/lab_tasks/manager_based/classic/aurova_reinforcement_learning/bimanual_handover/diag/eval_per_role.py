@@ -29,6 +29,17 @@ parser.add_argument('--task', type=str, default='Isaac-Bimanual-Bidirectional-v0
 parser.add_argument('--checkpoint', type=str, required=True)
 parser.add_argument('--num_envs', type=int, default=64)
 parser.add_argument('--steps', type=int, default=4000)
+# For checkpoints trained BEFORE randomize_giver existed (e.g. the fixed-role
+# control 4292718): evaluating them with randomisation on puts the object in
+# the other arm's hand half the time, a situation they never saw in training.
+# Evaluate with sampled rather than mean actions, i.e. the policy AS TRAINED.
+# Matters when a policy's competence depends on its action noise: the control
+# 4292718 scored 3.5% deterministically while its training logs showed
+# stage1_fraction 0.647 and episodes ~180 steps vs 343 deterministic.
+parser.add_argument('--stochastic', action='store_true',
+                    help='sample actions (deterministic=False), as during training')
+parser.add_argument('--fixed_roles', action='store_true',
+                    help='force randomize_giver=False, as pre-randomisation checkpoints were trained')
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args(sys.argv[1:] + ['--experience', '/isaac-sim/apps/omni.isaac.sim.python.kit'])
 args_cli.headless = True
@@ -50,10 +61,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import networks  # noqa: F401  (registers SharedArmActorCriticPolicy for unpickling)
 
 env_cfg = parse_env_cfg(task_name=args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
+if args_cli.fixed_roles:
+    env_cfg.randomize_giver = False
+    print('FIXED_ROLES: randomize_giver=False', flush=True)
 env = gym.make(args_cli.task, cfg=env_cfg); u = env.unwrapped
 model = PPO.load(args_cli.checkpoint)
 print(f"LOADED {args_cli.checkpoint}", flush=True)
-print(f"randomize_giver = {u.cfg.randomize_giver}   num_envs = {u.num_envs}", flush=True)
+print(f"randomize_giver = {u.cfg.randomize_giver}   num_envs = {u.num_envs}   "
+      f"action_selection = {'stochastic' if args_cli.stochastic else 'deterministic'}", flush=True)
 
 obs, _ = env.reset()
 N = u.num_envs
@@ -69,7 +84,7 @@ lens = {0: [], 1: []}
 peaks = {0: defaultdict(int), 1: defaultdict(int)}
 
 for step_i in range(args_cli.steps):
-    a_np, _ = model.predict(obs['policy'].cpu().numpy(), deterministic=True)
+    a_np, _ = model.predict(obs['policy'].cpu().numpy(), deterministic=not args_cli.stochastic)
     # CAREFUL with these two. IsaacLab requires _get_dones() to return
     # (terminated, time_out) -- direct_rl_env.py:338 unpacks it as
     # `self.reset_terminated[:], self.reset_time_outs[:] = self._get_dones()`.

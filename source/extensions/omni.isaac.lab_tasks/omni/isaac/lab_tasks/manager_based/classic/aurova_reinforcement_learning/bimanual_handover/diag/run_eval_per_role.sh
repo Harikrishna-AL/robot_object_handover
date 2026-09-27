@@ -36,7 +36,10 @@ TASKDIR=source/extensions/omni.isaac.lab_tasks/omni/isaac/lab_tasks/manager_base
 # exactly that way. Copy it to /home/hapi039h/eval_ckpts/ first.
 CKPT="${CKPT:?set CKPT to a snapshotted checkpoint, e.g. /home/hapi039h/eval_ckpts/roleswap_model_X_steps.zip}"
 test -f "$CKPT" || { echo "FATAL: checkpoint missing: $CKPT"; exit 1; }
-echo "NODE=$(hostname)  CKPT=$CKPT"
+EXTRA_ARGS=""
+[ "${FIXED_ROLES:-0}" = "1" ] && EXTRA_ARGS="$EXTRA_ARGS --fixed_roles"
+[ "${STOCHASTIC:-0}" = "1" ] && EXTRA_ARGS="$EXTRA_ARGS --stochastic"
+echo "NODE=$(hostname)  CKPT=$CKPT  EXTRA_ARGS=[$EXTRA_ARGS]"
 test -d "$TREE" || { echo "FATAL: tree missing: $TREE"; exit 1; }
 test -f "$SIF"  || { echo "FATAL: sif missing: $SIF";  exit 1; }
 
@@ -57,5 +60,5 @@ stdbuf -oL -eL apptainer exec --nv --containall \
   -B "$CACHE/ov":/root/.cache/ov:rw \
   "$TMPDIR/isaac-lab-base.sif" \
   bash -c "export ISAACLAB_PATH=/workspace/isaaclab && cd /workspace/isaaclab && \
-           /isaac-sim/python.sh $TASKDIR/diag/eval_per_role.py --num_envs 64 --steps 4000 --checkpoint /workspace/isaaclab/ckpt.zip"
+           /isaac-sim/python.sh $TASKDIR/diag/eval_per_role.py --num_envs 64 --steps 4000 --checkpoint /workspace/isaaclab/ckpt.zip $EXTRA_ARGS"
 echo EVAL_PER_ROLE_WRAPPER_DONE
