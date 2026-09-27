@@ -70,9 +70,24 @@ peaks = {0: defaultdict(int), 1: defaultdict(int)}
 
 for step_i in range(args_cli.steps):
     a_np, _ = model.predict(obs['policy'].cpu().numpy(), deterministic=True)
-    obs, rew, term, trunc, info = env.step(torch.as_tensor(a_np, device=u.device))
+    # CAREFUL with these two. IsaacLab requires _get_dones() to return
+    # (terminated, time_out) -- direct_rl_env.py:338 unpacks it as
+    # `self.reset_terminated[:], self.reset_time_outs[:] = self._get_dones()`.
+    # This env family returns (truncated, terminated) instead, swapped, since the
+    # baseline (bimanual_direct_env.py:826, commit 4a60502, June 2026) and
+    # inherited by the bidirectional and ICL envs. So:
+    #   fell  = the env's OWN `truncated`  -> falling / out-of-bounds / ground
+    #   ended = the env's OWN `terminated` -> time_out OR transfer_complete
+    # An earlier version of this script called the second one `trunc` and scored
+    # `peak >= 4 and not trunc`, which is unsatisfiable: reaching stage 4 sets
+    # transfer_complete, which sets that very flag. Job 4307499 therefore
+    # reported success=0 while its own histogram showed 260 episodes peaking at
+    # stage 4. Success is simply peak stage 4 -- the ladder is a one-way ratchet
+    # and stage 4 already requires the receiver to still hold the object after
+    # the giver let go.
+    obs, rew, fell, ended, info = env.step(torch.as_tensor(a_np, device=u.device))
     peak = torch.maximum(peak, u.stage)
-    done = torch.logical_or(term, trunc)
+    done = torch.logical_or(fell, ended)
     if torch.any(done):
         idx = done.nonzero(as_tuple=False).squeeze(-1)
         for i in idx.tolist():
@@ -80,10 +95,12 @@ for step_i in range(args_cli.steps):
             p = int(peak[i].item())
             stats[r]['episodes'] += 1
             peaks[r][p] += 1
-            if p >= 4 and not bool(trunc[i].item()):
+            if p >= 4:
                 stats[r]['success'] += 1
-            if bool(trunc[i].item()):
-                stats[r]['truncated'] += 1
+            if bool(fell[i].item()):
+                stats[r]['fell'] += 1
+            elif p < 4:
+                stats[r]['timeout'] += 1
             lens[r].append(step_i - int(ep_start[i].item()))
         # re-latch for the fresh episodes
         role[idx] = u.giver_is_gen3[idx]
@@ -96,10 +113,12 @@ for r, name in ((0, 'UR5e gives'), (1, 'GEN3 gives')):
     if n == 0:
         print(f"{name:12s}  no completed episodes", flush=True); continue
     s = stats[r]['success']
-    t = stats[r]['truncated']
+    f = stats[r]['fell']
+    to = stats[r]['timeout']
     ml = sum(lens[r]) / max(len(lens[r]), 1)
     print(f"{name:12s}  episodes={n:4d}  success={s:4d} ({100.0*s/n:5.1f}%)  "
-          f"truncated={t:4d} ({100.0*t/n:5.1f}%)  mean_len={ml:6.1f}", flush=True)
+          f"dropped/fell={f:4d} ({100.0*f/n:5.1f}%)  timeout={to:4d} ({100.0*to/n:5.1f}%)  "
+          f"mean_len={ml:6.1f}", flush=True)
     dist = "  ".join(f"s{k}:{peaks[r][k]}" for k in range(5))
     print(f"{'':12s}  peak stage -> {dist}", flush=True)
 
