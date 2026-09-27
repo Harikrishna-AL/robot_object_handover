@@ -34,10 +34,20 @@ args_cli = parser.parse_args(sys.argv[1:] + ['--experience', '/isaac-sim/apps/om
 args_cli.headless = True
 app_launcher = AppLauncher(args_cli); simulation_app = app_launcher.app
 
+import os
 import gymnasium as gym, torch
 from stable_baselines3 import PPO
 from omni.isaac.lab_tasks.utils import parse_env_cfg
 import omni.isaac.lab_tasks  # noqa
+
+# The checkpoint cloudpickles SharedArmActorCriticPolicy, so the module that
+# defines it must be importable under the SAME name it had at save time.
+# train.py does a bare `from networks import *` and gets away with it because
+# Python puts a script's own directory on sys.path -- networks.py sits next to
+# train.py. This script lives in diag/, so without this PPO.load dies with
+# "ModuleNotFoundError: No module named 'networks'" (job 4307343).
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "train"))
+import networks  # noqa: F401  (registers SharedArmActorCriticPolicy for unpickling)
 
 env_cfg = parse_env_cfg(task_name=args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
 env = gym.make(args_cli.task, cfg=env_cfg); u = env.unwrapped
