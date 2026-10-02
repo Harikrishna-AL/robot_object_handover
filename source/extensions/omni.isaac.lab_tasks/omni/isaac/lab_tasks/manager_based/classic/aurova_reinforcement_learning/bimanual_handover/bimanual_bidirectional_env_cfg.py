@@ -424,8 +424,25 @@ class BimanualBidirectionalCfg(BimanualDirectCfg):
     curriculum_ik_iters: int = 40
 
     curriculum_window: int = 200
-    curriculum_promote_rate: float = 0.60
+    # 0.35, lowered from 0.60 on 2026-10-02. Run 4295173 trained 409M steps and
+    # NEVER left level 0 -- metrics/curriculum_level took exactly one value for
+    # the whole run. Its pooled success rate peaked around 0.46, so a 0.60
+    # promotion threshold was unreachable by construction and the "curriculum"
+    # was just a permanently easier task: at frac 0.90 the meet point sits 0.019m
+    # from the receiver's own hand (measured, job 4313021) and 0.362m from the
+    # giver's, so the giver carries the object to the stationary receiver, which
+    # travels 5-7mm and closes its fingers. Every number reported from that run
+    # is a level-0 number. Same failure shape as the ICL demotion rule that
+    # reversed every promotion: a rule that can never fire silently redefines
+    # the task.
+    curriculum_promote_rate: float = 0.35
     curriculum_demote_rate: float = 0.15
+    # Belt-and-braces against the same class of stall: advance regardless of the
+    # success rate after this many env-steps at one level, the way the ICL
+    # curriculum does (icl_force_promote_steps). A performance-gated curriculum
+    # that cannot reach its own gate makes no progress at all, so there has to
+    # be a path upward that does not depend on the gate.
+    curriculum_force_promote_steps: int = 50_000_000
 
 
 

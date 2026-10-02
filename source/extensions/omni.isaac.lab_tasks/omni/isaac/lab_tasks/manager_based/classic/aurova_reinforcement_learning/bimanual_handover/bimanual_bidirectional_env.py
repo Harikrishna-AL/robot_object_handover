@@ -155,6 +155,11 @@ class BimanualBidirectional(BimanualDirect):
         self.curriculum_level = 0
         self._curr_ep_count = 0
         self._curr_succ_count = 0
+        # Env-steps spent at the current level, for forced promotion. Run 4295173
+        # sat at level 0 for all 409M steps because promotion needed a 0.60
+        # success rate it never reached (peak ~0.46), so every result from it is
+        # a level-0 result. See cfg.curriculum_force_promote_steps.
+        self._curr_steps_at_level = 0
         # Arm joint configuration that puts the receiver's hand on the object.
         # cfg.apply_range is [False, False] -- neither arm's reset pose is
         # randomised, so this target is identical in every episode.
@@ -1175,6 +1180,7 @@ class BimanualBidirectional(BimanualDirect):
 
         self._update_curriculum(success, episode_done)
         self.extras["log"]["metrics/curriculum_level"] = float(self.curriculum_level)
+        self.extras["log"]["metrics/curriculum_steps_at_level"] = float(self._curr_steps_at_level)
         self.extras["log"]["metrics/curriculum_start_frac"] = float(
             self.cfg.curriculum_start_frac[min(self.curriculum_level, len(self.cfg.curriculum_start_frac) - 1)]
         )
@@ -1215,13 +1221,25 @@ class BimanualBidirectional(BimanualDirect):
         # world coordinate would sometimes be trivially close to the holder
         # and sometimes outside its reach. Both arms are identical GEN3s at
         # a fixed separation, so the midpoint is reachable by construction.
-        ee_holder = self.scene.articulations[self.cfg.keys[self.cfg.UR5e]].data.body_state_w[
-            env_ids, self.ee_jacobi_idx[self.cfg.UR5e] + 1, 0:3
-        ]
-        ee_receiver = self.scene.articulations[self.cfg.keys[self.cfg.GEN3]].data.body_state_w[
-            env_ids, self.ee_jacobi_idx[self.cfg.GEN3] + 1, 0:3
-        ]
-        handoff = 0.5 * (ee_holder + ee_receiver)
+        # FINGERTIP centroids, not end effectors (changed 2026-10-02). The
+        # handoff point defines where the object must be delivered, and whether a
+        # grasp can close depends on where the FINGERS are -- but these were the
+        # ee_link positions, and the two arms' end-effector -> fingertip offsets
+        # point in different directions because robot_cfg_1 is rotated 180 deg
+        # about z to face the other arm. Measured on the 409M policy (job
+        # 4313021): with the same handoff_thresh of 0.08 on the end effector, the
+        # object arrived 0.054m from the receiver's fingertips when GEN3 gave and
+        # 0.095m when UR5e gave. The near direction grasped 328/342 times; the far
+        # one reached a sustained grasp ZERO times in 493 episodes, brushing the
+        # object (contact force 0.71 vs 1.38) without ever closing. One frame of
+        # reference produced the entire 88.8% / 0.0% split.
+        tips_holder = self.scene.articulations[self.cfg.keys[self.cfg.UR5e]].data.body_state_w[
+            env_ids, self.finger_tips[self.cfg.UR5e], 0:3
+        ].mean(1)
+        tips_receiver = self.scene.articulations[self.cfg.keys[self.cfg.GEN3]].data.body_state_w[
+            env_ids, self.finger_tips[self.cfg.GEN3], 0:3
+        ].mean(1)
+        handoff = 0.5 * (tips_holder + tips_receiver)
         handoff[:, 2] = handoff[:, 2] + self.cfg.handoff_height_offset
         self.handoff_pos[env_ids] = handoff
 
@@ -1325,13 +1343,17 @@ class BimanualBidirectional(BimanualDirect):
         if frac <= 0.0:
             return  # hardest level == the unmodified task
 
-        ee_ur5e = self.scene.articulations[cfg.keys[cfg.UR5e]].data.body_state_w[
-            :, self.ee_jacobi_idx[cfg.UR5e] + 1, 0:3
-        ]
-        ee_gen3 = self.scene.articulations[cfg.keys[cfg.GEN3]].data.body_state_w[
-            :, self.ee_jacobi_idx[cfg.GEN3] + 1, 0:3
-        ]
-        _, ee_receiver = self._pick_by_role(ee_ur5e, ee_gen3)
+        # Slide toward the receiver's FINGERTIPS for the same reason the reset
+        # midpoint uses them: the curriculum's whole point is to put the object
+        # where the receiver can close on it, and that is the fingers, not the
+        # end-effector frame.
+        tips_ur5e = self.scene.articulations[cfg.keys[cfg.UR5e]].data.body_state_w[
+            :, self.finger_tips[cfg.UR5e], 0:3
+        ].mean(1)
+        tips_gen3 = self.scene.articulations[cfg.keys[cfg.GEN3]].data.body_state_w[
+            :, self.finger_tips[cfg.GEN3], 0:3
+        ].mean(1)
+        _, ee_receiver = self._pick_by_role(tips_ur5e, tips_gen3)
         # handoff_pos was just set to the midpoint by _reset_idx; slide it
         # toward the receiver's hand by `frac`.
         midpoint = self.handoff_pos
@@ -1349,6 +1371,18 @@ class BimanualBidirectional(BimanualDirect):
         cfg = self.cfg
         if not cfg.use_reverse_curriculum:
             return
+        max_level = len(cfg.curriculum_start_frac) - 1
+
+        # Counted before any early return, so a level cannot stall simply
+        # because no episode happened to finish on a given step.
+        self._curr_steps_at_level += self.num_envs
+        if (
+            self._curr_steps_at_level >= cfg.curriculum_force_promote_steps
+            and self.curriculum_level < max_level
+        ):
+            self._set_curriculum_level(self.curriculum_level + 1)
+            return
+
         n_done = int(done.sum().item())
         if n_done == 0:
             return
@@ -1358,10 +1392,18 @@ class BimanualBidirectional(BimanualDirect):
             return
 
         rate = self._curr_succ_count / max(self._curr_ep_count, 1)
-        max_level = len(cfg.curriculum_start_frac) - 1
         if rate >= cfg.curriculum_promote_rate and self.curriculum_level < max_level:
-            self.curriculum_level += 1
+            self._set_curriculum_level(self.curriculum_level + 1)
         elif rate < cfg.curriculum_demote_rate and self.curriculum_level > 0:
-            self.curriculum_level -= 1
+            self._set_curriculum_level(self.curriculum_level - 1)
+        else:
+            self._curr_ep_count = 0
+            self._curr_succ_count = 0
+
+    def _set_curriculum_level(self, level: int):
+        '''Change level and clear EVERY counter in one place, so a future edit
+        cannot leave one of them stale -- the same guard the ICL curriculum uses.'''
+        self.curriculum_level = level
         self._curr_ep_count = 0
         self._curr_succ_count = 0
+        self._curr_steps_at_level = 0

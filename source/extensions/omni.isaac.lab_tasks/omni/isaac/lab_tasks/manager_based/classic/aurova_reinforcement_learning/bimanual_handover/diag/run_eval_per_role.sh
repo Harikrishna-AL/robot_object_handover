@@ -26,7 +26,9 @@ set -euo pipefail
 # filesystems (/data/cat AND /data/horse) are not mounted on Capella compute
 # nodes -- probed three nodes (c3, c156 x2), none could see either, while /home
 # was visible on all three. /home is NFS and always available.
-TREE=/home/hapi039h/isaaclab
+# TREE override lets a pre-role-randomisation checkout be evaluated, so a
+# checkpoint can be scored in the code it was actually trained with.
+TREE="${TREE:-/home/hapi039h/isaaclab}"
 SIF=/home/hapi039h/isaac-lab-base.sif
 TASKDIR=source/extensions/omni.isaac.lab_tasks/omni/isaac/lab_tasks/manager_based/classic/aurova_reinforcement_learning/bimanual_handover
 

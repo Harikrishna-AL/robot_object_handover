@@ -61,20 +61,30 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import networks  # noqa: F401  (registers SharedArmActorCriticPolicy for unpickling)
 
 env_cfg = parse_env_cfg(task_name=args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
-if args_cli.fixed_roles:
+if args_cli.fixed_roles and hasattr(env_cfg, 'randomize_giver'):
     env_cfg.randomize_giver = False
     print('FIXED_ROLES: randomize_giver=False', flush=True)
 env = gym.make(args_cli.task, cfg=env_cfg); u = env.unwrapped
 model = PPO.load(args_cli.checkpoint)
 print(f"LOADED {args_cli.checkpoint}", flush=True)
-print(f"randomize_giver = {u.cfg.randomize_giver}   num_envs = {u.num_envs}   "
+# An env WITHOUT role randomisation (a tree checked out before that change) has
+# no giver_is_gen3 / randomize_giver at all. Run against it anyway, treating
+# every episode as "UR5e gives" -- that is what those trees do. This is how a
+# pre-randomisation checkpoint gets evaluated in the code it was trained with,
+# which matters because _assign_roles rewrites the RECEIVER's starting hand pose
+# (open_hand_joints puts 0.263 on joint_1_0, while GEN3_4f_CFG.init_state puts it
+# on joint_12_0), so even randomize_giver=False is not the old reset behaviour.
+_HAS_ROLES = hasattr(u, 'giver_is_gen3')
+print(f"has_role_randomisation = {_HAS_ROLES}   "
+      f"randomize_giver = {getattr(u.cfg, 'randomize_giver', 'n/a')}   num_envs = {u.num_envs}   "
       f"action_selection = {'stochastic' if args_cli.stochastic else 'deterministic'}", flush=True)
 
 obs, _ = env.reset()
 N = u.num_envs
 # Role latched at reset; peak stage tracked within the episode. Both must be
 # read BEFORE the env resets the env, so they are updated every step.
-role = u.giver_is_gen3.clone()
+role = (u.giver_is_gen3.clone() if _HAS_ROLES
+        else torch.zeros(u.num_envs, dtype=torch.bool, device=u.device))
 peak = u.stage.clone()
 ep_start = torch.zeros(N, dtype=torch.long, device=u.device)
 step_i = 0
@@ -118,7 +128,8 @@ for step_i in range(args_cli.steps):
                 stats[r]['timeout'] += 1
             lens[r].append(step_i - int(ep_start[i].item()))
         # re-latch for the fresh episodes
-        role[idx] = u.giver_is_gen3[idx]
+        if _HAS_ROLES:
+            role[idx] = u.giver_is_gen3[idx]
         peak[idx] = u.stage[idx]
         ep_start[idx] = step_i
 
