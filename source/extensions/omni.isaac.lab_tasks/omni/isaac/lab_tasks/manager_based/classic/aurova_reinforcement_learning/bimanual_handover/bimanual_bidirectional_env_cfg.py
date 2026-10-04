@@ -281,9 +281,30 @@ class BimanualBidirectionalCfg(BimanualDirectCfg):
     # object_height_limit is NOT affected: it is computed in BimanualDirectCfg's
     # class body from the PARENT's ee_init_pose_quat[0,2]=0.6499, so overriding
     # this tensor leaves it at 0.2499.
+    # REVERTED 2026-10-04, same day: the palms-facing pose above BREAKS THE GRIP.
+    # Job 4369216 ran the role-swap check with it (weld off, arms commanded still,
+    # 300 steps) and the object was not held in either direction -- UR5e-gives fell
+    # 0.066m, GEN3-gives was pushed UPWARD 0.156m, which is interpenetration
+    # ejecting it rather than a grasp. balance/scalar/placement all passed; only
+    # the grip failed.
+    #
+    # The search objective was at fault, not the search. It constrained
+    # giver_tips_to_obj to stay near 0.15m -- a STATIC distance at reset, which
+    # says nothing about whether the fingers are wrapped around the object.
+    # Rotating the hand puts the object against a different part of the palm, and
+    # both _CLOSED_HAND_JOINTS and obj_pos_trans (bimanual_direct_env_cfg.py:267)
+    # were tuned for the ORIGINAL orientation. A distance constraint cannot catch
+    # that; only simulating the hold can.
+    #
+    # Palms-facing therefore needs obj_pos_trans/obj_quat_trans re-solved jointly
+    # with the target pose, scored by "object still held after 300 steps" rather
+    # than by a reset-time distance. Candidate that achieved 8.3 deg, kept for
+    # that search to start from:
+    #   [0.2994, 0.0797, 0.8606, -0.4521, -0.2032, 0.5853, -0.6416]
+    #   [0.2902, 0.0297, 0.8606, -0.4521, -0.2032, 0.5853, -0.6416]
     ee_init_pose_quat = torch.tensor([
-        [0.2994, 0.0797, 0.8606, -0.4521, -0.2032, 0.5853, -0.6416],  # UR5e slot
-        [0.2902, 0.0297, 0.8606, -0.4521, -0.2032, 0.5853, -0.6416],  # GEN3 slot
+        [0.3046, 0.0250, 0.825, -0.6946, 0.2523, -0.6092, 0.2877],  # UR5e row: recomputed so world target = GEN3 row's world target, accounting for UR5e's new 180deg root rotation + 0.6m separation
+        [0.2954, -0.0250, 0.825, -0.6946, 0.2523, -0.6092, 0.2877],
     ])
     _r, _p, _y = euler_xyz_from_quat(ee_init_pose_quat[:, 3:])
     _euler = torch.cat((_r.unsqueeze(-1), _p.unsqueeze(-1), _y.unsqueeze(-1)), dim=-1)
