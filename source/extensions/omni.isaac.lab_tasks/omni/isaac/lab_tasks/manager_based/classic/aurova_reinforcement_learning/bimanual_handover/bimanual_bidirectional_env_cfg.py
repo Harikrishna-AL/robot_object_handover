@@ -253,9 +253,37 @@ class BimanualBidirectionalCfg(BimanualDirectCfg):
     # it is translation-invariant -- valid regardless of which world position
     # the clone's base sits at, as long as it is unrotated (it is, see
     # robot_cfg_1 above).
+    # PALMS FACING EACH OTHER (2026-10-04). The previous orientation
+    # (-0.6946, 0.2523, -0.6092, 0.2877) was GEN3's original SINGLE-ARM grasp
+    # orientation, tuned for reaching down to an object on a table, and it left
+    # the two hands side-on to each other: measured 96.4 deg and 107.5 deg
+    # between each hand's grasp direction (mean fingertip minus palm) and the
+    # direction to the other hand, where 0 deg is palms facing.
+    #
+    # Replaced with a measured value, not a guess. Two earlier attempts found the
+    # wrong knob: a full circle of arm_joint_7 changed the angle by 0.1 deg (the
+    # palm points ALONG the tool axis, so rolling the wrist spins it in place),
+    # and arm_joint_2 looked promising until it turned out reset_robot_ee's
+    # differential IK overwrites init_state joint angles entirely. The knob that
+    # sticks is this target pose.
+    #
+    # Position AND orientation had to move together: that IK is a SINGLE
+    # differential step, so changing the target orientation also shifts the
+    # achieved position. An orientation-only sweep (job 4368290) reached 10 deg
+    # but dropped the object to z=0.23, below object_height_limit=0.2499, which
+    # would truncate every episode at step 0. A constrained 6-DOF search (job
+    # 4368944, 458/700 samples feasible) gives:
+    #
+    #   palm angle   107.5 deg -> 8.3 deg
+    #   object z     0.969     -> 0.5225   (limit 0.2499)
+    #   giver tips->object 0.1600 -> 0.1508
+    #
+    # object_height_limit is NOT affected: it is computed in BimanualDirectCfg's
+    # class body from the PARENT's ee_init_pose_quat[0,2]=0.6499, so overriding
+    # this tensor leaves it at 0.2499.
     ee_init_pose_quat = torch.tensor([
-        [0.3046, 0.0250, 0.825, -0.6946, 0.2523, -0.6092, 0.2877],  # UR5e row: recomputed so world target = GEN3 row's world target, accounting for UR5e's new 180deg root rotation + 0.6m separation
-        [0.2954, -0.0250, 0.825, -0.6946, 0.2523, -0.6092, 0.2877],
+        [0.2994, 0.0797, 0.8606, -0.4521, -0.2032, 0.5853, -0.6416],  # UR5e slot
+        [0.2902, 0.0297, 0.8606, -0.4521, -0.2032, 0.5853, -0.6416],  # GEN3 slot
     ])
     _r, _p, _y = euler_xyz_from_quat(ee_init_pose_quat[:, 3:])
     _euler = torch.cat((_r.unsqueeze(-1), _p.unsqueeze(-1), _y.unsqueeze(-1)), dim=-1)

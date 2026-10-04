@@ -1233,12 +1233,17 @@ class BimanualBidirectional(BimanualDirect):
         # one reached a sustained grasp ZERO times in 493 episodes, brushing the
         # object (contact force 0.71 vs 1.38) without ever closing. One frame of
         # reference produced the entire 88.8% / 0.0% split.
+        # Mean over fingertips FIRST, then select env_ids. Indexing
+        # body_state_w[env_ids, finger_tips, 0:3] advanced-indexes both dims at
+        # once and fails to broadcast [n_envs] against [n_fingertips] -- unlike
+        # the ee_jacobi_idx version this replaced, whose body index is a scalar.
+        # Caught by job 4367966 before any training run used it.
         tips_holder = self.scene.articulations[self.cfg.keys[self.cfg.UR5e]].data.body_state_w[
-            env_ids, self.finger_tips[self.cfg.UR5e], 0:3
-        ].mean(1)
+            :, self.finger_tips[self.cfg.UR5e], 0:3
+        ].mean(1)[env_ids]
         tips_receiver = self.scene.articulations[self.cfg.keys[self.cfg.GEN3]].data.body_state_w[
-            env_ids, self.finger_tips[self.cfg.GEN3], 0:3
-        ].mean(1)
+            :, self.finger_tips[self.cfg.GEN3], 0:3
+        ].mean(1)[env_ids]
         handoff = 0.5 * (tips_holder + tips_receiver)
         handoff[:, 2] = handoff[:, 2] + self.cfg.handoff_height_offset
         self.handoff_pos[env_ids] = handoff

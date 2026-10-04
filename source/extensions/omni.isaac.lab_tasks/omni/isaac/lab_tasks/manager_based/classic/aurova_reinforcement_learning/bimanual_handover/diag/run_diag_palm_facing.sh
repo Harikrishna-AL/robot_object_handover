@@ -50,5 +50,5 @@ stdbuf -oL -eL apptainer exec --nv --containall \
   -B "$CACHE/ov":/root/.cache/ov:rw \
   "$TMPDIR/isaac-lab-base.sif" \
   bash -c "export ISAACLAB_PATH=/workspace/isaaclab && cd /workspace/isaaclab && \
-           /isaac-sim/python.sh $TASKDIR/diag/diag_palm_facing.py --num_envs 4 --settle 30"
+           /isaac-sim/python.sh $TASKDIR/diag/diag_palm_facing.py --num_envs 4 --settle 30 --joints \"${JOINTS:-arm_joint_7,arm_joint_5}\" --pairs \"${PAIRS:-}\""
 echo DIAG_PALM_FACING_WRAPPER_DONE

@@ -37,6 +37,16 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--task', type=str, default='Isaac-Bimanual-Bidirectional-v0')
 parser.add_argument('--num_envs', type=int, default=4)
 parser.add_argument('--settle', type=int, default=30, help='sim steps to settle after each write')
+# Which joints to sweep. Measured 2026-10-04 (job 4368049): a FULL circle of
+# arm_joint_7 moved the worse facing angle from 81.3 to 81.3 deg, and
+# arm_joint_5 to 79.9 -- i.e. the palm points essentially ALONG the tool axis,
+# so rolling the wrist spins the hand about its own pointing direction without
+# redirecting it. Redirecting the palm needs the PITCH chain (2/4/6), which
+# changes the arm's whole posture.
+parser.add_argument('--joints', type=str, default='arm_joint_7,arm_joint_5',
+                    help='comma-separated arm joint names to sweep individually')
+parser.add_argument('--pairs', type=str, default='',
+                    help="comma-separated 'jointA:jointB' to sweep jointly on a coarse grid")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args(sys.argv[1:] + ['--experience', '/isaac-sim/apps/omni.isaac.sim.python.kit'])
 args_cli.headless = True
@@ -124,13 +134,47 @@ def sweep(col, label):
           f"-> UR5e {best[2]:.1f} deg, GEN3 {best[3]:.1f} deg", flush=True)
     return best
 
-b7 = sweep(j7, 'arm_joint_7')
-b5 = sweep(j5, 'arm_joint_5')
+base_worse = max(a_u, a_g)
+results = {}
+for name in [x.strip() for x in args_cli.joints.split(',') if x.strip()]:
+    col = arm_names.index(name)
+    results[name] = sweep(col, name)
+
+def sweep_pair(colA, nameA, colB, nameB, n=8):
+    print(f"\n=== JOINT SWEEP {nameA} x {nameB} ({n}x{n} grid) ===", flush=True)
+    best = None
+    for ia in range(n):
+        va = -math.pi + 2 * math.pi * ia / n
+        row = []
+        for ib in range(n):
+            vb = -math.pi + 2 * math.pi * ib / n
+            q = {idx: q0[idx].clone() for idx in (U, G3)}
+            for idx in (U, G3):
+                q[idx][:, colA] = va
+                q[idx][:, colB] = vb
+            hold_and_step(q)
+            au, ag, _ = geom()
+            worse = max(au, ag)
+            row.append(worse)
+            if best is None or worse < best[2]:
+                best = (va, vb, worse, au, ag)
+        print(f"  {nameA}={va:7.3f}  " + " ".join(f"{w:5.1f}" for w in row), flush=True)
+    print(f"  BEST {nameA}={best[0]:.4f} {nameB}={best[1]:.4f} -> worse {best[2]:.1f} deg "
+          f"(UR5e {best[3]:.1f}, GEN3 {best[4]:.1f})", flush=True)
+    return best
+
+pair_best = {}
+for spec in [x.strip() for x in args_cli.pairs.split(',') if x.strip()]:
+    nA, nB = spec.split(':')
+    pair_best[spec] = sweep_pair(arm_names.index(nA), nA, arm_names.index(nB), nB)
 
 print(f"\n=== SUMMARY ===", flush=True)
-print(f"  baseline worse-of-two      = {max(a_u, a_g):.1f} deg", flush=True)
-print(f"  best via arm_joint_7       = {b7[1]:.1f} deg at {b7[0]:.4f} rad", flush=True)
-print(f"  best via arm_joint_5       = {b5[1]:.1f} deg at {b5[0]:.4f} rad", flush=True)
-print(f"  current config arm_joint_7 = {float(q0[U][0, j7]):.4f} rad, arm_joint_5 = {float(q0[U][0, j5]):.4f} rad", flush=True)
+print(f"  baseline worse-of-two = {base_worse:.1f} deg", flush=True)
+for name, b in results.items():
+    print(f"  best via {name:14s} = {b[1]:6.1f} deg at {b[0]:8.4f} rad "
+          f"(config now {float(q0[U][0, arm_names.index(name)]):.4f})", flush=True)
+for spec, b in pair_best.items():
+    print(f"  best via {spec:14s} = {b[2]:6.1f} deg at {b[0]:.4f} / {b[1]:.4f} rad", flush=True)
+print(f"  TARGET: both angles near 0 deg means palms point at each other.", flush=True)
 print("DIAG_PALM_FACING_DONE", flush=True)
 simulation_app.close()
