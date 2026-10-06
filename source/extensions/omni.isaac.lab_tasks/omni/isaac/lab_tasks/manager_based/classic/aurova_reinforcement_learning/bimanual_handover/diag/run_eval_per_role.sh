@@ -41,6 +41,7 @@ test -f "$CKPT" || { echo "FATAL: checkpoint missing: $CKPT"; exit 1; }
 EXTRA_ARGS=""
 [ "${FIXED_ROLES:-0}" = "1" ] && EXTRA_ARGS="$EXTRA_ARGS --fixed_roles"
 [ "${STOCHASTIC:-0}" = "1" ] && EXTRA_ARGS="$EXTRA_ARGS --stochastic"
+[ -n "${CURRICULUM_LEVEL:-}" ] && EXTRA_ARGS="$EXTRA_ARGS --curriculum_level $CURRICULUM_LEVEL"
 echo "NODE=$(hostname)  CKPT=$CKPT  EXTRA_ARGS=[$EXTRA_ARGS]"
 test -d "$TREE" || { echo "FATAL: tree missing: $TREE"; exit 1; }
 test -f "$SIF"  || { echo "FATAL: sif missing: $SIF";  exit 1; }

@@ -40,6 +40,25 @@ parser.add_argument('--stochastic', action='store_true',
                     help='sample actions (deterministic=False), as during training')
 parser.add_argument('--fixed_roles', action='store_true',
                     help='force randomize_giver=False, as pre-randomisation checkpoints were trained')
+# PPO.save()/load() only touches the policy network and optimizer -- it has no
+# knowledge of self.curriculum_level, a plain env attribute. So a fresh eval env
+# ALWAYS starts at level 0, regardless of what level training ended on. For a
+# run that stayed at level 0 throughout (e.g. 4295173, before this was fixed)
+# that happens to match. For a run that explored levels 0-4 and was demoted back
+# to 0 right as the 48h wall hit (4368187: climbed to level 3, one bad window
+# crashed it back to 0 with 4.67M steps left, no time to recover), a naive eval
+# would silently measure the EASIEST setting instead of the real task.
+#
+# level 4 (curriculum_start_frac[4] == 0.0) IS the real task: frac<=0.0 makes
+# _apply_curriculum_reset return immediately, leaving handoff_pos as the
+# unmodified fingertip midpoint. So --curriculum_level 4 and disabling the
+# curriculum entirely are the same thing; this flag generalises to the other
+# levels too, which is useful for reproducing what training actually saw at
+# each rung. _update_curriculum is monkey-patched to a no-op so a low success
+# rate during eval cannot demote the level out from under the measurement.
+parser.add_argument('--curriculum_level', type=int, default=None,
+                    help='pin to this curriculum level (0-4) instead of training\'s current value; '
+                         '4 = the real, unmodified task')
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args(sys.argv[1:] + ['--experience', '/isaac-sim/apps/omni.isaac.sim.python.kit'])
 args_cli.headless = True
@@ -78,6 +97,14 @@ _HAS_ROLES = hasattr(u, 'giver_is_gen3')
 print(f"has_role_randomisation = {_HAS_ROLES}   "
       f"randomize_giver = {getattr(u.cfg, 'randomize_giver', 'n/a')}   num_envs = {u.num_envs}   "
       f"action_selection = {'stochastic' if args_cli.stochastic else 'deterministic'}", flush=True)
+
+if args_cli.curriculum_level is not None:
+    assert hasattr(u, 'curriculum_level'), "this env has no reverse curriculum"
+    u.curriculum_level = args_cli.curriculum_level
+    u._update_curriculum = lambda success, done: None   # pin it: no promote/demote during eval
+    print(f"PINNED curriculum_level = {u.curriculum_level}  "
+          f"(curriculum_start_frac = {u.cfg.curriculum_start_frac[min(u.curriculum_level, len(u.cfg.curriculum_start_frac)-1)]})",
+          flush=True)
 
 obs, _ = env.reset()
 N = u.num_envs
