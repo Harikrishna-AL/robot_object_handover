@@ -1,31 +1,10 @@
-"""
-Find the reset end-effector ORIENTATION that makes the two palms face each other.
+"""Generate Cartesian reset candidates using actual palm surface normals.
 
-This sweeps the right knob. An earlier sweep (job 4368193) varied joint angles
-directly and found that at arm_joint_2 = -pi/8 -- exactly the value already in
-GEN3_4f_CFG.init_state -- the palms sit 10-17 deg from facing each other, versus
-75-81 deg as actually observed at reset. The reason they differ: reset_robot_ee
-(bimanual_direct_env.py:853) samples a target end-effector pose from
-cfg.ee_init_pose and runs a differential IK step toward it, which overrides the
-init_state joint angles. So init_state is NOT what determines the reset pose, and
-editing it changes nothing.
-
-The knob that sticks is the ORIENTATION in cfg.ee_init_pose_quat, shared by both
-rows: (-0.6946, 0.2523, -0.6092, 0.2877). That is GEN3's original single-arm
-grasp orientation, tuned for reaching down to an object on a table rather than
-presenting it to another hand.
-
-Both rows are expressed in each robot's OWN root frame, and robot_cfg_1's root is
-rotated 180 deg about z, so one shared orientation already mirrors correctly
-between the arms -- which is why one value can serve both and why, when one palm
-points the wrong way, both do.
-
-Searched by writing roll/pitch/yaw into self.ee_pose_ranges and calling the real
-env.reset(), so whatever wins here goes through the same code path training will.
-Reports the winning quaternion ready to paste into the config, plus the object's
-resulting height and the giver's fingertip->object distance, because rotating the
-end effector also moves where the object is placed and the closed grip must
-survive it.
+The outward normal is hand_palm_link +X, established by the positive-X palm
+contact plates in the asset. Earlier versions used mean fingertip minus palm;
+that is a finger-extension proxy and their reported angles were not palm angles.
+This static search does not prove grip stability. Validate candidates with
+weld-free physical holding in both roles and joint/collision checks.
 """
 import argparse, math, sys
 from omni.isaac.lab.app import AppLauncher
@@ -50,12 +29,13 @@ args_cli.headless = True
 app_launcher = AppLauncher(args_cli); simulation_app = app_launcher.app
 
 import gymnasium as gym, torch
-from omni.isaac.lab.utils.math import quat_from_euler_xyz
+from omni.isaac.lab.utils.math import quat_from_euler_xyz, quat_apply
 from omni.isaac.lab_tasks.utils import parse_env_cfg
 import omni.isaac.lab_tasks  # noqa
 
 env_cfg = parse_env_cfg(task_name=args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
 env_cfg.randomize_giver = False
+env_cfg.reset_arm_joint_pos = None
 env = gym.make(args_cli.task, cfg=env_cfg); u = env.unwrapped
 U, G3 = u.cfg.UR5e, u.cfg.GEN3
 
@@ -80,8 +60,9 @@ def measure():
     for idx in (U, G3):
         art = u.scene.articulations[u.cfg.keys[idx]]
         p = art.data.body_state_w[:, palm_idx[idx], 0:3]
-        f = art.data.body_state_w[:, u.finger_tips[idx], 0:3].mean(1)
-        pos[idx], gdir[idx] = p, torch.nn.functional.normalize(f - p, dim=-1)
+        normal = torch.tensor([1.0, 0.0, 0.0], device=u.device).expand(u.num_envs, -1)
+        pos[idx] = p
+        gdir[idx] = quat_apply(art.data.body_state_w[:, palm_idx[idx], 3:7], normal)
     ang = {}
     for idx, other in ((U, G3), (G3, U)):
         to_other = torch.nn.functional.normalize(pos[other] - pos[idx], dim=-1)
@@ -103,15 +84,11 @@ def set_rpy(delta):
             u.ee_pose_ranges[idx, 3 + k, 1] = base_rpy[idx, k] + delta[k]
 
 def set_pose(dpos, drpy):
-    '''Position AND orientation delta, same for both arms (each in its own root
-    frame, so the 180deg base rotation keeps them mirrored).
+    """Apply root-relative position and orientation deltas to both arms.
 
-    Both are needed together: reset_robot_ee runs a SINGLE differential IK step
-    toward the target pose, so changing the target orientation also changes the
-    joint solution and moves the achieved position. Job 4368290 swept orientation
-    alone and every palms-facing candidate dropped the object from z=0.969 to
-    0.06-0.49, i.e. below object_height_limit=0.2499, which truncates every
-    episode at step 0. Position has to move to compensate.'''
+    The parent's single differential-IK reset step couples achieved position
+    and orientation. Geometry candidates still need dynamic grip validation.
+    """
     for idx in (U, G3):
         for k in range(3):
             u.ee_pose_ranges[idx, k, 0] = base_pos[idx, k] + dpos[k]

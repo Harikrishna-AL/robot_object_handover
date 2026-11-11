@@ -147,6 +147,9 @@ class BimanualBidirectional(BimanualDirect):
         self._succ_window_eps = 0
         self._succ_window_hits = 0
         self._succ_rate_per_episode = 0.0
+        self._role_succ_window_eps = [0, 0]
+        self._role_succ_window_hits = [0, 0]
+        self._role_succ_rate_per_episode = [0.0, 0.0]
 
         # --- Reverse curriculum state (2026-09-10) -------------------------
         # One global level shared by all envs (not per-env): promotion is
@@ -1019,6 +1022,9 @@ class BimanualBidirectional(BimanualDirect):
         log["metrics/stage_mean"] = self.stage.float().mean().item()
         for k in range(1, 5):
             log[f"metrics/stage{k}_fraction"] = (self.stage >= k).float().mean().item()
+            for role, mask in enumerate((~self.giver_is_gen3, self.giver_is_gen3)):
+                if torch.any(mask):
+                    log[f"metrics/giver_slot{role}_stage{k}_fraction"] = (self.stage[mask] >= k).float().mean().item()
         log["metrics/present_dist"] = present_dist.mean().item()
         log["metrics/hand_obj_dist"] = reach_dist.mean().item()
         log["metrics/arm_arm_collision"] = arm_arm_contact.mean().item()
@@ -1132,21 +1138,37 @@ class BimanualBidirectional(BimanualDirect):
         # Column order fixed by update_collisions_bidirectional(): ur5e_w_ground, gen3_w_ground first.
         ground_contact = torch.logical_or(self.contacts[:, 0] > 0.0, self.contacts[:, 1] > 0.0)
 
-        truncated = torch.logical_or(torch.logical_or(falling, out_of_bounds), ground_contact)
+        object_pos = self.scene.rigid_objects["object"].data.body_state_w[:, 0, :3]
+        hand_positions = [
+            self.scene.articulations[key].data.body_state_w[:, self.ee_jacobi_idx[idx] + 1, :3]
+            for idx, key in enumerate(self.cfg.keys)
+        ]
+        nearest_hand_dist = torch.minimum(
+            torch.norm(object_pos - hand_positions[0], dim=-1),
+            torch.norm(object_pos - hand_positions[1], dim=-1),
+        )
+        object_escaped = (~torch.isfinite(nearest_hand_dist)) | (
+            nearest_hand_dist > self.cfg.object_escape_distance
+        )
+        failure = falling | out_of_bounds | ground_contact | object_escaped
         # Success is now a SINGLE completed transfer (stage 4), matching the
         # ALOHA transfer-cube benchmark's own success definition, rather than
         # the round trip -- which was strictly harder than the published task
         # and never fired once in any run.
-        terminated = torch.logical_or(time_out, self.transfer_complete)
+        # DirectRLEnv expects (terminated, time_outs). The old implementation
+        # returned these in reverse, causing SB3 to bootstrap successful
+        # transfers as if they were time-limit truncations.
+        terminated = failure | self.transfer_complete
+        time_outs = time_out & ~terminated
 
-        success = self.transfer_complete & ~truncated
-        indet = self.transfer_complete & truncated
-        fail = ~self.transfer_complete & (terminated | truncated)
+        success = self.transfer_complete & ~failure
+        indet = self.transfer_complete & failure
+        fail = ~self.transfer_complete & (terminated | time_outs)
 
         # Stashed for _get_rewards, which runs immediately after _get_dones in
         # DirectRLEnv.step and charges cfg.penalty_truncation for ending an
         # episode this way. See the reward's own comment for why.
-        self._last_truncated = truncated
+        self._last_truncated = failure
 
         if "log" not in self.extras:
             self.extras["log"] = dict()
@@ -1162,12 +1184,14 @@ class BimanualBidirectional(BimanualDirect):
         self.extras["log"]["metrics/trunc_ground_contact"] = ground_contact.float().mean().item()
         self.extras["log"]["metrics/trunc_arm_falling"] = torch.logical_or(ur5e_falling, gen3_falling).float().mean().item()
         self.extras["log"]["metrics/trunc_object_falling"] = object_falling.float().mean().item()
-        self.extras["log"]["metrics/trunc_any"] = truncated.float().mean().item()
+        self.extras["log"]["metrics/trunc_object_escaped"] = object_escaped.float().mean().item()
+        self.extras["log"]["metrics/object_nearest_hand_dist"] = nearest_hand_dist.mean().item()
+        self.extras["log"]["metrics/trunc_any"] = failure.float().mean().item()
 
         # True per-episode success rate over a window of COMPLETED episodes --
         # see the counters' comment in __init__ for why the per-step version
         # was off by roughly the episode length.
-        episode_done = torch.logical_or(truncated, terminated)
+        episode_done = terminated | time_outs
         n_done = int(episode_done.sum().item())
         if n_done:
             self._succ_window_eps += n_done
@@ -1177,6 +1201,20 @@ class BimanualBidirectional(BimanualDirect):
                 self._succ_window_eps = 0
                 self._succ_window_hits = 0
         self.extras["log"]["metrics/success_rate_per_episode"] = self._succ_rate_per_episode
+        for role, mask in enumerate((~self.giver_is_gen3, self.giver_is_gen3)):
+            n_role_done = int((episode_done & mask).sum().item())
+            if n_role_done:
+                self._role_succ_window_eps[role] += n_role_done
+                self._role_succ_window_hits[role] += int((success & episode_done & mask).sum().item())
+                if self._role_succ_window_eps[role] >= self.cfg.success_window:
+                    self._role_succ_rate_per_episode[role] = (
+                        self._role_succ_window_hits[role] / self._role_succ_window_eps[role]
+                    )
+                    self._role_succ_window_eps[role] = 0
+                    self._role_succ_window_hits[role] = 0
+            self.extras["log"][f"metrics/slot{role}_success_ep_rate"] = (
+                self._role_succ_rate_per_episode[role]
+            )
 
         self._update_curriculum(success, episode_done)
         self.extras["log"]["metrics/curriculum_level"] = float(self.curriculum_level)
@@ -1185,7 +1223,29 @@ class BimanualBidirectional(BimanualDirect):
             self.cfg.curriculum_start_frac[min(self.curriculum_level, len(self.cfg.curriculum_start_frac) - 1)]
         )
 
-        return truncated, terminated
+        return terminated, time_outs
+
+    def reset_robot_ee(self, idx, env_ids):
+        """Reset to a validated joint pose when configured, without one-step IK."""
+        arm_pose = self.cfg.reset_arm_joint_pos
+        if arm_pose is None:
+            return super().reset_robot_ee(idx, env_ids)
+
+        art = self.scene.articulations[self.cfg.keys[idx]]
+        joint_pos = art.data.default_joint_pos[env_ids].clone()
+        arm_q = torch.as_tensor(arm_pose[idx], device=self.device, dtype=joint_pos.dtype)
+        if arm_q.shape != (len(self._robot_joints_idx[idx]),):
+            raise ValueError(f"reset_arm_joint_pos[{idx}] must contain one value per arm joint")
+        joint_pos[:, self._robot_joints_idx[idx]] = arm_q
+        art.write_joint_state_to_sim(
+            joint_pos, torch.zeros_like(joint_pos), env_ids=env_ids
+        )
+        art.set_joint_position_target(joint_pos, env_ids=env_ids)
+        ordered = joint_pos[:, self._all_joints_idx[idx]]
+        self.reset_joint_positions[idx][env_ids] = ordered
+        self.actions[idx][env_ids] = ordered
+        pos, quat, _, _ = self._get_ee_pose(idx)
+        self.reset_robot_poses_r[idx][env_ids] = torch.cat((pos, quat), dim=-1)[env_ids]
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         # Reuses BimanualDirect._reset_idx wholesale: resets both arms to

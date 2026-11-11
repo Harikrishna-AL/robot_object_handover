@@ -28,6 +28,7 @@ parser.add_argument("--num_envs", type=int, default=None, help="Number of enviro
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument("--checkpoint_freq", type=int, default=500, help="Checkpoint interval in environment steps.")
 parser.add_argument("--train", type=bool, default=True, help="Wether to train or perform normal loop")
 parser.add_argument("--vel_rew", action="store_true", default=False, help="Add velocity penalty reward term")
 parser.add_argument("--use_force_rewards", action="store_true", default=False)
@@ -103,7 +104,10 @@ from networks import *
 
 
 # directory for logging into
-path_to_train = "/workspace/isaaclab/source/extensions/omni.isaac.lab_tasks/omni/isaac/lab_tasks/manager_based/classic/aurova_reinforcement_learning/bimanual_handover/train"
+path_to_train = os.environ.get(
+    "BIMANUAL_LOG_ROOT",
+    "/workspace/isaaclab/source/extensions/omni.isaac.lab_tasks/omni/isaac/lab_tasks/manager_based/classic/aurova_reinforcement_learning/bimanual_handover/train",
+)
 log_dir = os.path.join(path_to_train, "logs", "sb3", args_cli.task, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
 run = wandb.init(project="bim_hand_dani_julio", name=log_dir.split("/")[-1], sync_tensorboard=True)
 
@@ -205,7 +209,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent.set_logger(new_logger)
 
     # callbacks for agent
-    checkpoint_callback = CheckpointCallback(save_freq=500, save_path=log_dir, name_prefix="model", verbose=2)
+    checkpoint_callback = CheckpointCallback(save_freq=args_cli.checkpoint_freq, save_path=log_dir, name_prefix="model", verbose=2)
     
     if args_cli.train:
         # train the agent

@@ -95,6 +95,11 @@ class CustomActorCriticPolicy(ActorCriticPolicy):
 
         # Reinitialize parameters (important)
         self.action_net.apply(self.init_weights)
+        # SB3 built its optimizer around the original action head in super().
+        # Rebuild it so the replacement head is actually trained.
+        self.optimizer = self.optimizer_class(
+            self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs
+        )
 
 
 # Applies ONE shared-weight MLP trunk to each arm's self-centric observation
@@ -213,6 +218,12 @@ class SharedArmActorCriticPolicy(ActorCriticPolicy):
             hidden_dim=hidden, action_dim_per_arm=self._action_dim_per_arm, device=self.device
         )
         self.action_net.apply(self.init_weights)
+
+        # ActorCriticPolicy.__init__ already built an optimizer containing the
+        # discarded default head. Register the shared head before training.
+        self.optimizer = self.optimizer_class(
+            self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs
+        )
 
     def _build_mlp_extractor(self) -> None:
         self.mlp_extractor = SharedArmMlpExtractor(

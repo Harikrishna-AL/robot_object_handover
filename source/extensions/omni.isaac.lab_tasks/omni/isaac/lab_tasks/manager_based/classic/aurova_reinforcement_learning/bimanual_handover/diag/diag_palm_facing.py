@@ -1,34 +1,14 @@
-"""
-Which way do the two palms actually face, and what wrist angle makes them face
-each other?
+"""Measure actual palm-facing directions and sweep arm joints.
 
-Prompted by an observation on the 409M video: "the back of their hands are facing
-each other, that makes the task harder". Both slots hold identical GEN3 hardware
-with identical arm joint angles, and robot_cfg_1 is rotated 180 deg about z
-(rot=(0,0,0,1)), so the two palm normals are related by that same rotation --
-meaning if one faces away from the other arm, BOTH do. That is consistent with
-the observation and with the measured failure: in the UR5e-gives direction the
-object arrives 0.095m from the receiver's fingertips and a grasp never closes.
+The front contact plates (palm_aux_link and palm_aux2_link) are thin in X and
+located at positive X in hand_palm_link; its +X axis is the outward palm normal.
+The old mean-fingertip-minus-palm vector measured finger extension instead.
+With an open hand these axes can be nearly perpendicular, so previous proxy
+angles and conclusions about wrist roll did not establish palm orientation.
 
-"Palm direction" is measured WITHOUT relying on USD axis conventions:
-
-    grasp_dir = normalize(mean_fingertip_pos - palm_pos)
-
-i.e. the direction the fingers extend and curl toward. Palms face each other when
-each arm's grasp_dir points at the other arm's palm. Reported as the angle
-between grasp_dir and the vector to the other palm: 0 deg = facing it, 180 deg =
-facing away.
-
-Then sweeps arm_joint_7 (the final wrist rotation) over a full circle and reports
-the angle at each value, for both arms, so the config can be set to a measured
-value rather than a guessed one. If joint_7 alone cannot fix it, arm_joint_5 is
-swept too -- the palm normal may not be perpendicular to the tool axis, in which
-case rolling the tool does not reorient the palm at all.
-
-Joint state is written and then the SIM IS STEPPED before reading poses:
-write_joint_state_to_sim refreshes joint_pos but NOT body_state_w (link
-transforms need a real physics step), which is the trap that made an earlier IK
-placement attempt diverge (job 4166925).
+Angle 0 means the palm surface faces the other hand; 180 means its back does.
+A geometry sweep is only a candidate generator: verify real grip retention,
+joint limits, and collisions before changing the environment.
 """
 import argparse, math, sys
 from omni.isaac.lab.app import AppLauncher
@@ -37,12 +17,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--task', type=str, default='Isaac-Bimanual-Bidirectional-v0')
 parser.add_argument('--num_envs', type=int, default=4)
 parser.add_argument('--settle', type=int, default=30, help='sim steps to settle after each write')
-# Which joints to sweep. Measured 2026-10-04 (job 4368049): a FULL circle of
-# arm_joint_7 moved the worse facing angle from 81.3 to 81.3 deg, and
-# arm_joint_5 to 79.9 -- i.e. the palm points essentially ALONG the tool axis,
-# so rolling the wrist spins the hand about its own pointing direction without
-# redirecting it. Redirecting the palm needs the PITCH chain (2/4/6), which
-# changes the arm's whole posture.
+# Wrist roll can change the true palm normal even when the finger axis barely moves.
 parser.add_argument('--joints', type=str, default='arm_joint_7,arm_joint_5',
                     help='comma-separated arm joint names to sweep individually')
 parser.add_argument('--pairs', type=str, default='',
@@ -54,6 +29,7 @@ app_launcher = AppLauncher(args_cli); simulation_app = app_launcher.app
 
 import gymnasium as gym, torch
 from omni.isaac.lab_tasks.utils import parse_env_cfg
+from omni.isaac.lab.utils.math import quat_apply
 import omni.isaac.lab_tasks  # noqa
 
 env_cfg = parse_env_cfg(task_name=args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
@@ -83,9 +59,9 @@ def geom():
     for idx in (U, G3):
         art = u.scene.articulations[u.cfg.keys[idx]]
         p = art.data.body_state_w[:, palm_idx[idx], 0:3]
-        f = art.data.body_state_w[:, u.finger_tips[idx], 0:3].mean(1)
         pos[idx] = p
-        gdir[idx] = torch.nn.functional.normalize(f - p, dim=-1)
+        normal = torch.tensor([1.0, 0.0, 0.0], device=dev).expand(u.num_envs, -1)
+        gdir[idx] = quat_apply(art.data.body_state_w[:, palm_idx[idx], 3:7], normal)
     for idx, other in ((U, G3), (G3, U)):
         to_other = torch.nn.functional.normalize(pos[other] - pos[idx], dim=-1)
         cos = (gdir[idx] * to_other).sum(-1).clamp(-1.0, 1.0)
@@ -110,9 +86,9 @@ hold_and_step(q0)
 a_u, a_g, sep = geom()
 print(f"\n=== BASELINE (as configured) ===", flush=True)
 print(f"  palm separation            = {sep:.4f} m", flush=True)
-print(f"  UR5e-slot (screen-LEFT)  grasp_dir vs toward-other = {a_u:6.1f} deg", flush=True)
-print(f"  GEN3-slot (screen-RIGHT) grasp_dir vs toward-other = {a_g:6.1f} deg", flush=True)
-print(f"  (0 = palm/fingers point at the other arm, 180 = point away)", flush=True)
+print(f"  UR5e-slot (screen-LEFT)  palm normal vs toward-other = {a_u:6.1f} deg", flush=True)
+print(f"  GEN3-slot (screen-RIGHT) palm normal vs toward-other = {a_g:6.1f} deg", flush=True)
+print(f"  (0 = palm front faces the other arm, 180 = palm back faces it)", flush=True)
 
 def sweep(col, label):
     print(f"\n=== SWEEP {label} (both arms set to the same value) ===", flush=True)

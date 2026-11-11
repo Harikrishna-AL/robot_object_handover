@@ -108,6 +108,16 @@ _CLOSED_HAND_JOINTS = {
 @configclass
 class BimanualBidirectionalCfg(BimanualDirectCfg):
 
+    # The parent's 0.25 g bar acquires extreme velocity after incidental
+    # finger contact. A 50 g trial over-loaded the existing gripper controller;
+    # test a smaller increase without changing the original single-arm task.
+    object_escape_distance: float = 0.6
+
+    def __post_init__(self):
+        # configclass supplies an independent object_cfg instance for each
+        # configuration and runs its own deep-copy post-init after this method.
+        self.object_cfg.spawn.mass_props.mass = 0.005
+
     # Recenter the render/video viewer camera on this task's own arm
     # midpoint. Diagnosed 2026-08-15: the parent's viewer (eye/lookat x
     # centered at -0.625) was tuned for the ORIGINAL single-arm slot layout
@@ -253,55 +263,11 @@ class BimanualBidirectionalCfg(BimanualDirectCfg):
     # it is translation-invariant -- valid regardless of which world position
     # the clone's base sits at, as long as it is unrotated (it is, see
     # robot_cfg_1 above).
-    # PALMS FACING EACH OTHER (2026-10-04). The previous orientation
-    # (-0.6946, 0.2523, -0.6092, 0.2877) was GEN3's original SINGLE-ARM grasp
-    # orientation, tuned for reaching down to an object on a table, and it left
-    # the two hands side-on to each other: measured 96.4 deg and 107.5 deg
-    # between each hand's grasp direction (mean fingertip minus palm) and the
-    # direction to the other hand, where 0 deg is palms facing.
-    #
-    # Replaced with a measured value, not a guess. Two earlier attempts found the
-    # wrong knob: a full circle of arm_joint_7 changed the angle by 0.1 deg (the
-    # palm points ALONG the tool axis, so rolling the wrist spins it in place),
-    # and arm_joint_2 looked promising until it turned out reset_robot_ee's
-    # differential IK overwrites init_state joint angles entirely. The knob that
-    # sticks is this target pose.
-    #
-    # Position AND orientation had to move together: that IK is a SINGLE
-    # differential step, so changing the target orientation also shifts the
-    # achieved position. An orientation-only sweep (job 4368290) reached 10 deg
-    # but dropped the object to z=0.23, below object_height_limit=0.2499, which
-    # would truncate every episode at step 0. A constrained 6-DOF search (job
-    # 4368944, 458/700 samples feasible) gives:
-    #
-    #   palm angle   107.5 deg -> 8.3 deg
-    #   object z     0.969     -> 0.5225   (limit 0.2499)
-    #   giver tips->object 0.1600 -> 0.1508
-    #
-    # object_height_limit is NOT affected: it is computed in BimanualDirectCfg's
-    # class body from the PARENT's ee_init_pose_quat[0,2]=0.6499, so overriding
-    # this tensor leaves it at 0.2499.
-    # REVERTED 2026-10-04, same day: the palms-facing pose above BREAKS THE GRIP.
-    # Job 4369216 ran the role-swap check with it (weld off, arms commanded still,
-    # 300 steps) and the object was not held in either direction -- UR5e-gives fell
-    # 0.066m, GEN3-gives was pushed UPWARD 0.156m, which is interpenetration
-    # ejecting it rather than a grasp. balance/scalar/placement all passed; only
-    # the grip failed.
-    #
-    # The search objective was at fault, not the search. It constrained
-    # giver_tips_to_obj to stay near 0.15m -- a STATIC distance at reset, which
-    # says nothing about whether the fingers are wrapped around the object.
-    # Rotating the hand puts the object against a different part of the palm, and
-    # both _CLOSED_HAND_JOINTS and obj_pos_trans (bimanual_direct_env_cfg.py:267)
-    # were tuned for the ORIGINAL orientation. A distance constraint cannot catch
-    # that; only simulating the hold can.
-    #
-    # Palms-facing therefore needs obj_pos_trans/obj_quat_trans re-solved jointly
-    # with the target pose, scored by "object still held after 300 steps" rather
-    # than by a reset-time distance. Candidate that achieved 8.3 deg, kept for
-    # that search to start from:
-    #   [0.2994, 0.0797, 0.8606, -0.4521, -0.2032, 0.5853, -0.6416]
-    #   [0.2902, 0.0297, 0.8606, -0.4521, -0.2032, 0.5853, -0.6416]
+    # Legacy Cartesian targets, retained for diagnostics with
+    # reset_arm_joint_pos=None. The default reset now uses the validated joint
+    # posture below; a single differential-IK step toward these targets turned
+    # the posture into outward-facing palms. Finger-extension angles used by
+    # the older diagnostics were not palm-normal angles.
     ee_init_pose_quat = torch.tensor([
         [0.3046, 0.0250, 0.825, -0.6946, 0.2523, -0.6092, 0.2877],  # UR5e row: recomputed so world target = GEN3 row's world target, accounting for UR5e's new 180deg root rotation + 0.6m separation
         [0.2954, -0.0250, 0.825, -0.6946, 0.2523, -0.6092, 0.2877],
@@ -343,6 +309,21 @@ class BimanualBidirectionalCfg(BimanualDirectCfg):
     lambda_holder_still: float = 0.0
 
     apply_range = [False, False]
+
+    # Optional physically validated arm configurations, one row per arm. This
+    # bypasses the parent's single differential-IK reset step. None preserves
+    # the legacy Cartesian reset for comparison with existing checkpoints.
+    reset_arm_joint_pos: list | None = [
+        [-1.3300872961, -0.6354533138, 0.5143971765, 2.3244245004, 0.3010790179, -1.7455882714, 0.1739881729],
+        [-1.3300872961, -0.6354533138, 0.5143971765, 2.3244245004, 0.3010790179, -1.7455882714, 0.1739881729],
+    ]
+    # Actual palm front is +X in hand_palm_link (positive-X contact plates),
+    # not the finger-extension direction used by the earlier diagnostics.
+    # Both palm normals point toward the other palm, within 0.1 degrees;
+    # palms start 0.32 m apart. Joint posture and EE-relative object placement
+    # were tested together for 900 physics steps (4.5 s), weld off, in BOTH
+    # giving directions: <5.0 mm relative object motion and no arm contact.
+    obj_pos_trans = torch.tensor([-0.0944901258, -0.1421129405, 0.0968664438])
 
     # Grasp-detection was firing on single-frame incidental contact (see
     # _phase_reward's contact_streak comment in bimanual_bidirectional_env.py,
