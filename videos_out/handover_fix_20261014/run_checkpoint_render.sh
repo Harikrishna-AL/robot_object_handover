@@ -1,0 +1,29 @@
+#!/bin/bash
+#SBATCH --partition=capella
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:1
+#SBATCH --gpus-per-task=1
+#SBATCH --time=00:45:00
+#SBATCH --mem=48G
+#SBATCH --exclude=c130,c145,c155,c79,c100,c111
+#SBATCH --job-name=handover-ckpt-video
+#SBATCH --output=/home/hapi039h/codex_handover_20261014/ckpt_render_%j.log
+set -euo pipefail
+TASK_ROOT=/home/hapi039h/codex_handover_20261014
+SCRATCH_WORK="${TMPDIR:-/tmp}/codex_ckpt_render_${SLURM_JOB_ID}"
+mkdir -p "$SCRATCH_WORK/tree" "$SCRATCH_WORK/cache/kit" "$SCRATCH_WORK/cache/gl" "$SCRATCH_WORK/cache/compute" "$SCRATCH_WORK/cache/ov"
+mkdir -p "$TASK_ROOT/results/checkpoint_35840000"
+tar -C "$TASK_ROOT/tree" --exclude=.git --exclude=outputs --exclude=wandb --exclude=logs -cf - . | tar -C "$SCRATCH_WORK/tree" -xf -
+ln -sfn /isaac-sim "$SCRATCH_WORK/tree/_isaac_sim"
+apptainer exec --nv --containall \
+  -B "$SCRATCH_WORK/tree":/workspace/isaaclab:rw \
+  -B "$TASK_ROOT":/diagnostics:rw \
+  -B "$TASK_ROOT/results":/results:rw \
+  -B "$SCRATCH_WORK/cache/kit":/isaac-sim/kit/cache:rw \
+  -B "$SCRATCH_WORK/cache/gl":/root/.cache/nvidia/GLCache:rw \
+  -B "$SCRATCH_WORK/cache/compute":/root/.nv/ComputeCache:rw \
+  -B "$SCRATCH_WORK/cache/ov":/root/.cache/ov:rw \
+  /home/hapi039h/isaac-lab-base.sif \
+  bash -lc 'export ISAACLAB_PATH=/workspace/isaaclab; cd /workspace/isaaclab; /isaac-sim/python.sh /diagnostics/render_checkpoint.py --checkpoint /diagnostics/checkpoint_35840000.zip --output /results/checkpoint_35840000'

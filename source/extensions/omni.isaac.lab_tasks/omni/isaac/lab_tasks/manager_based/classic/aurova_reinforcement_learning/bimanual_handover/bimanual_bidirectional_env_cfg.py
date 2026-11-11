@@ -317,6 +317,13 @@ class BimanualBidirectionalCfg(BimanualDirectCfg):
         [-1.3300872961, -0.6354533138, 0.5143971765, 2.3244245004, 0.3010790179, -1.7455882714, 0.1739881729],
         [-1.3300872961, -0.6354533138, 0.5143971765, 2.3244245004, 0.3010790179, -1.7455882714, 0.1739881729],
     ]
+    # Phase 1 of start-pose generalization. Both arms receive independent
+    # shoulder/elbow offsets on each reset, while some episodes retain the
+    # original pose to guard against forgetting the demonstrated handover.
+    arm_start_randomization: bool = False
+    arm_start_nominal_fraction: float = 0.25
+    arm_start_shoulder_range_rad: float = 0.03
+    arm_start_elbow_range_rad: float = 0.025
     # Actual palm front is +X in hand_palm_link (positive-X contact plates),
     # not the finger-extension direction used by the earlier diagnostics.
     # Both palm normals point toward the other palm, within 0.1 degrees;

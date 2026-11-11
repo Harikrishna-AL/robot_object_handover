@@ -1,0 +1,48 @@
+[
+  {
+    "giver": 0,
+    "reset_repeat_max_joint_error": 0.0,
+    "steps": 300,
+    "seconds": 4.5,
+    "automatic_resets": 0,
+    "max_object_relative_drift": 0.004447534680366516,
+    "object_dz": -0.004301607608795166,
+    "max_arm_joint_drift": 0.012452363967895508,
+    "mean_giver_contact_force": 4.196297121047974,
+    "video": "left_slot_gives_setup.mp4",
+    "peak_stage": 0,
+    "initial_receiver_tips_to_object": 0.33257168531417847,
+    "max_receiver_contact_force": 0.0,
+    "initial_true_palm_angles": [
+      0.0,
+      0.0
+    ],
+    "max_true_palm_angles": [
+      0.8355625867843628,
+      0.4945600628852844
+    ]
+  },
+  {
+    "giver": 1,
+    "reset_repeat_max_joint_error": 0.0,
+    "steps": 300,
+    "seconds": 4.5,
+    "automatic_resets": 0,
+    "max_object_relative_drift": 0.006866819225251675,
+    "object_dz": 0.001087963581085205,
+    "max_arm_joint_drift": 0.021696120500564575,
+    "mean_giver_contact_force": 4.398363251686096,
+    "video": "right_slot_gives_setup.mp4",
+    "peak_stage": 0,
+    "initial_receiver_tips_to_object": 0.33257153630256653,
+    "max_receiver_contact_force": 0.0,
+    "initial_true_palm_angles": [
+      0.0,
+      0.0
+    ],
+    "max_true_palm_angles": [
+      0.6655846834182739,
+      2.293966770172119
+    ]
+  }
+]

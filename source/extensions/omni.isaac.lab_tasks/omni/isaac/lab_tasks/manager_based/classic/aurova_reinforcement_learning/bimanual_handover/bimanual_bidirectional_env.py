@@ -112,6 +112,7 @@ class BimanualBidirectional(BimanualDirect):
         # DirectRLEnv.step). Initialised here so the very first _get_rewards
         # call is safe if the order ever changes.
         self._last_truncated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._arm_start_nominal = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # Closed-grip hand pose for the GIVER, taken from the articulation's own
         # default joint positions -- the same source BimanualDirect uses for its
@@ -1236,6 +1237,13 @@ class BimanualBidirectional(BimanualDirect):
         arm_q = torch.as_tensor(arm_pose[idx], device=self.device, dtype=joint_pos.dtype)
         if arm_q.shape != (len(self._robot_joints_idx[idx]),):
             raise ValueError(f"reset_arm_joint_pos[{idx}] must contain one value per arm joint")
+        arm_q = arm_q.expand(len(env_ids), -1).clone()
+        if self.cfg.arm_start_randomization:
+            active = ~self._arm_start_nominal[env_ids]
+            shoulder = (2.0 * torch.rand(len(env_ids), device=self.device) - 1.0)
+            elbow = (2.0 * torch.rand(len(env_ids), device=self.device) - 1.0)
+            arm_q[:, 0] += active * shoulder * self.cfg.arm_start_shoulder_range_rad
+            arm_q[:, 2] += active * elbow * self.cfg.arm_start_elbow_range_rad
         joint_pos[:, self._robot_joints_idx[idx]] = arm_q
         art.write_joint_state_to_sim(
             joint_pos, torch.zeros_like(joint_pos), env_ids=env_ids
@@ -1254,6 +1262,11 @@ class BimanualBidirectional(BimanualDirect):
         # zeroes the doubled contact/force tensors (already correctly sized
         # since self.num_contacts is computed generically from
         # len(cfg.contact_sensors_dict) in BimanualDirect.__init__).
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        self._arm_start_nominal[env_ids] = (
+            torch.rand(len(env_ids), device=self.device) < self.cfg.arm_start_nominal_fraction
+        ) if self.cfg.arm_start_randomization else True
         super()._reset_idx(env_ids)
 
         self._assign_roles(env_ids)
