@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<robot name="xarm7" xmlns:xacro="http://ros.org/wiki/xacro">
+  <xacro:property name="mesh_suffix" value="stl"/>
+  <xacro:property name="use_xacro_load_yaml" value="true"/>
+  <xacro:property name="mesh_path" value="MESHROOT"/>
+  <xacro:include filename="XARM_DESCRIPTION/urdf/common/common.link.xacro"/>
+  <xacro:include filename="XARM_DESCRIPTION/urdf/xarm7/xarm7.urdf.xacro"/>
+  <xacro:xarm7_urdf prefix="" model_num="0"
+     kinematics_params_filename="XARM_DESCRIPTION/config/kinematics/default/xarm7_default_kinematics.yaml"/>
+</robot>
