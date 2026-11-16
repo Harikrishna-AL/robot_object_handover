@@ -60,7 +60,9 @@ parser.add_argument('--curriculum_level', type=int, default=None,
                     help='pin to this curriculum level (0-4) instead of training\'s current value; '
                          '4 = the real, unmodified task')
 AppLauncher.add_app_launcher_args(parser)
-args_cli = parser.parse_args(sys.argv[1:] + ['--experience', '/isaac-sim/apps/omni.isaac.sim.python.kit'])
+# No forced --experience: Isaac Sim's full profile segfaults on the post-Nov-2026 driver;
+# the default is Isaac Lab's headless profile (source/apps/isaaclab.python.headless.kit).
+args_cli = parser.parse_args()
 args_cli.headless = True
 app_launcher = AppLauncher(args_cli); simulation_app = app_launcher.app
 
