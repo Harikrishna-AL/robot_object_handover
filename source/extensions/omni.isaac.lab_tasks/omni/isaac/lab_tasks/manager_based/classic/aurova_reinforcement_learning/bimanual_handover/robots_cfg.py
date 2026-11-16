@@ -50,6 +50,32 @@ GEN3_4f_CFG = ArticulationCfg(
 
 )
 
+
+# UFactory xArm7 carrying the same 16-DOF 4-finger hand -- the lab's hardware. Built from
+# config/urdf/xarm7_4f.urdf (provenance: config/urdf/xarm_src/README.md): GEN3's hand,
+# contact links and mount kept unchanged, arm replaced. Converted to USD with the same
+# settings as gen3_4f.usd. The arm actuators are GEN3_4f_CFG's: robot bodies have gravity
+# disabled in this task, so the PD gains only track commanded motion, and keeping them
+# identical keeps the controller behaviour of the GEN3 runs that worked.
+#
+# The default arm posture puts hand_palm_link at exactly the pose GEN3's validated handover
+# posture did (identity orientation at (0.14, 0, 0.85) in the arm base frame: palm front +X
+# at the other arm, palms 0.32 m apart). Solved with URDF forward kinematics + damped least
+# squares over many seeds, UFactory joint limits respected; chosen for the largest worst-case
+# dexterity (Jacobian min singular value 0.208 vs 0.143 for GEN3's own pose) with >= 0.32 m
+# between the two arms' links. Must still be validated in simulation (grip, palm facing,
+# no arm contact) -- see diag/validate_xarm_pose.py.
+XARM7_HANDOVER_Q = [-0.6799084361, -1.148776091, 0.2116508428, 0.8330124805,
+                    -2.9324690166, 1.1761795864, 1.2938908653]
+XARM7_4f_CFG = GEN3_4f_CFG.replace(
+    spawn=GEN3_4f_CFG.spawn.replace(
+        usd_path=GEN3_4f_CFG.spawn.usd_path.replace("gen3_4f.usd", "xarm7_4f.usd"),
+    ),
+    init_state=GEN3_4f_CFG.init_state.replace(
+        joint_pos={**{f"arm_joint_{k + 1}": v for k, v in enumerate(XARM7_HANDOVER_Q)}, "joint_12_0": 0.263},
+    ),
+)
+
 UR5e_4f_CFG = ArticulationCfg(
     spawn = sim_utils.UsdFileCfg(
         usd_path="/workspace/isaaclab/source/extensions/omni.isaac.lab_tasks/omni/isaac/lab_tasks/manager_based/classic/aurova_reinforcement_learning/bimanual_handover/config/usd/ur5e_4f_ros2.usd",

@@ -9,7 +9,7 @@ from omni.isaac.lab.utils import configclass
 from omni.isaac.lab.utils.math import euler_xyz_from_quat
 
 from .bimanual_direct_env_cfg import BimanualDirectCfg
-from .robots_cfg import GEN3_4f_CFG
+from .robots_cfg import GEN3_4f_CFG, XARM7_4f_CFG, XARM7_HANDOVER_Q
 
 '''
                 ############## IMPORTANT #################
@@ -540,7 +540,8 @@ def update_collisions_bidirectional(cfg, num_envs):
     # flagged, with the rate stepping up exactly as the arms closed in, i.e.
     # the penalty was actively fighting stage 2. Genuine forearm/upper-arm
     # collisions are still caught.
-    arm_only = _GEN3_ARM_LINK_NAMES
+    # Per-config so another arm (xArm7) can supply its own link names; GEN3 by default.
+    arm_only = list(getattr(cfg, "arm_link_names", None) or _GEN3_ARM_LINK_NAMES)
     arm_link_regex = "(" + "|".join(arm_only) + ")"
     contact_sensors_dict["robot1_w_robot2"] = ContactSensorCfg(
         prim_path="/World/envs/env_.*/" + cfg.keys[cfg.GEN3] + "/" + arm_link_regex,
@@ -565,3 +566,38 @@ def update_collisions_bidirectional(cfg, num_envs):
     ))
 
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# xArm7 variant (the lab's arms): identical task, hand, rewards, curriculum and
+# object placement; only the arm differs. Registered as
+# Isaac-Bimanual-Bidirectional-xArm-v0 so the GEN3 task stays untouched.
+# ---------------------------------------------------------------------------
+# link_base is merged into `world` by the converter (fixed joint, as GEN3's base
+# was not), so the arm bodies are link1..link7.
+_XARM_ARM_LINK_NAMES = [f"link{k}" for k in range(1, 8)]
+_XARM_LINK_NAMES = _XARM_ARM_LINK_NAMES + [n for n in _GEN3_LINK_NAMES if n.startswith("hand_")]
+
+
+@configclass
+class BimanualBidirectionalXArmCfg(BimanualBidirectionalCfg):
+    robot_cfg_1: Articulation = XARM7_4f_CFG.replace(
+        prim_path="/World/envs/env_.*/UR5e",
+        spawn=XARM7_4f_CFG.spawn.replace(
+            # separate USD file per slot: two articulations sharing one instanceable
+            # prototype froze rendering earlier in this project (see gen3_4f_arm2.usd)
+            usd_path=XARM7_4f_CFG.spawn.usd_path.replace("xarm7_4f.usd", "xarm7_4f_arm2.usd"),
+        ),
+        init_state=XARM7_4f_CFG.init_state.replace(
+            pos=(-0.65, 0.0, 0.0), rot=(0.0, 0.0, 0.0, 1.0),
+            joint_pos={**XARM7_4f_CFG.init_state.joint_pos, **_CLOSED_HAND_JOINTS},
+        ),
+    )
+    robot_cfg_2: Articulation = XARM7_4f_CFG.replace(prim_path="/World/envs/env_.*/GEN3")
+    links = [_XARM_LINK_NAMES, _XARM_LINK_NAMES]
+    arm_link_names: list = _XARM_ARM_LINK_NAMES
+    # GEN3's tool_frame (a zero-offset child of the flange) is merged into link7 by the
+    # converter, so link7 IS the same frame. obj_pos_trans and the hand mount are defined
+    # relative to it, so both carry over unchanged.
+    ee_link = ["link7", "link7"]
+    reset_arm_joint_pos: list | None = [list(XARM7_HANDOVER_Q), list(XARM7_HANDOVER_Q)]
