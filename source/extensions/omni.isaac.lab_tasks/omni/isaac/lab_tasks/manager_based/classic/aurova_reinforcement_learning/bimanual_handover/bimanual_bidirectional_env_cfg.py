@@ -112,6 +112,8 @@ class BimanualBidirectionalCfg(BimanualDirectCfg):
     # finger contact. A 50 g trial over-loaded the existing gripper controller;
     # test a smaller increase without changing the original single-arm task.
     object_escape_distance: float = 0.6
+    # See BimanualBidirectional._get_dones. False keeps the GEN3/v4 code path unchanged.
+    ignore_ground_contact_first_step: bool = False
 
     def __post_init__(self):
         # configclass supplies an independent object_cfg instance for each
@@ -601,3 +603,4 @@ class BimanualBidirectionalXArmCfg(BimanualBidirectionalCfg):
     # relative to it, so both carry over unchanged.
     ee_link = ["link7", "link7"]
     reset_arm_joint_pos: list | None = [list(XARM7_HANDOVER_Q), list(XARM7_HANDOVER_Q)]
+    ignore_ground_contact_first_step: bool = True

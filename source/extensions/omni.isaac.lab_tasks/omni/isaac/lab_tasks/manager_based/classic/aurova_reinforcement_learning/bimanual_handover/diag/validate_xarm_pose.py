@@ -42,16 +42,21 @@ ang0 = torch.rad2deg(torch.acos((P[k0][1] * d01 / sep[:, None]).sum(-1).clamp(-1
 ang1 = torch.rad2deg(torch.acos((P[k1][1] * -d01 / sep[:, None]).sum(-1).clamp(-1, 1)))
 role = u.giver_is_gen3.clone()      # True: slot 1 gives
 obj = u.scene.rigid_objects["object"]
+from omni.isaac.lab.utils.math import quat_rotate_inverse
 def rel_obj():
-    o = obj.data.root_pos_w - origins
-    giver_pos = torch.where(role[:, None], palms()[k1][0], palms()[k0][0])
-    return o - giver_pos
+    """Object position in the GIVER's palm frame, so drift means the grip slipping rather
+    than the whole hand rotating. (A world-frame difference read 38 mm on GEN3, job 4589779.)"""
+    o = obj.data.root_pos_w
+    st = torch.where(role[:, None], u.scene.articulations[k1].data.body_state_w[:, palm[k1]],
+                     u.scene.articulations[k0].data.body_state_w[:, palm[k0]])
+    return quat_rotate_inverse(st[:, 3:7], o - st[:, :3])
 r0 = rel_obj(); z0 = (obj.data.root_pos_w - origins)[:, 2].clone()
 zero = torch.zeros((u.num_envs, env.action_space.shape[-1]), device=u.device)
 max_drift = torch.zeros(u.num_envs, device=u.device); arm_contact = torch.zeros(u.num_envs, dtype=torch.bool, device=u.device)
 ended = torch.zeros(u.num_envs, dtype=torch.bool, device=u.device)
 first_end = None
-for t in range(a.steps):
+steps = min(a.steps, int(u.max_episode_length) - 2)   # stay inside one episode
+for t in range(steps):
     _, _, term, tout, info = env.step(zero)
     done = term | tout
     if first_end is None and done.any():
@@ -69,7 +74,7 @@ for t in range(a.steps):
     max_drift = torch.where(live, torch.maximum(max_drift, (rel_obj() - r0).norm(dim=-1)), max_drift)
     arm_contact |= (u.contacts[:, -1] > 0) & live
 z1 = (obj.data.root_pos_w - origins)[:, 2]
-res = {"task": a.task, "num_envs": u.num_envs, "steps": a.steps,
+res = {"task": a.task, "num_envs": u.num_envs, "steps": steps,
        "palm_separation_m": [round(float(sep.min()), 4), round(float(sep.max()), 4)],
        "palm_facing_deg_slot0": round(float(ang0.max()), 2), "palm_facing_deg_slot1": round(float(ang1.max()), 2),
        "slot0_palm_local_xyz": [round(float(v), 3) for v in P[k0][0][0]], "slot1_palm_local_xyz": [round(float(v), 3) for v in P[k1][0][0]],

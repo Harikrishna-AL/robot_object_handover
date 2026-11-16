@@ -1138,6 +1138,13 @@ class BimanualBidirectional(BimanualDirect):
 
         # Column order fixed by update_collisions_bidirectional(): ur5e_w_ground, gen3_w_ground first.
         ground_contact = torch.logical_or(self.contacts[:, 0] > 0.0, self.contacts[:, 1] > 0.0)
+        if self.cfg.ignore_ground_contact_first_step:
+            # self.contacts for an episode's first step comes from the observation computed
+            # at reset, i.e. sensor data from physics that predates the episode. On the xArm
+            # that leftover from scene startup reads ~9995 N of floor force on every hand at
+            # the first reset (job 4590018), killing all envs at step 0, after which readings
+            # are clean. episode_length_buf is already incremented here, so the first step is 1.
+            ground_contact = ground_contact & (self.episode_length_buf > 1)
 
         object_pos = self.scene.rigid_objects["object"].data.body_state_w[:, 0, :3]
         hand_positions = [
