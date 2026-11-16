@@ -50,9 +50,21 @@ r0 = rel_obj(); z0 = (obj.data.root_pos_w - origins)[:, 2].clone()
 zero = torch.zeros((u.num_envs, env.action_space.shape[-1]), device=u.device)
 max_drift = torch.zeros(u.num_envs, device=u.device); arm_contact = torch.zeros(u.num_envs, dtype=torch.bool, device=u.device)
 ended = torch.zeros(u.num_envs, dtype=torch.bool, device=u.device)
+first_end = None
 for t in range(a.steps):
-    _, _, term, tout, _ = env.step(zero)
-    ended |= (term | tout)
+    _, _, term, tout, info = env.step(zero)
+    done = term | tout
+    if first_end is None and done.any():
+        # extras["log"] is computed before the env resets the finished envs
+        log = info.get("log", {})
+        ee = [u.scene.articulations[k].data.body_state_w[:, u.ee_jacobi_idx[i] + 1] for i, k in enumerate(keys)]
+        first_end = {"step": t, "envs_done": int(done.sum()), "terminated": int(term.sum()), "time_out": int(tout.sum()),
+                     **{k.split("/")[-1]: round(float(v), 4) for k, v in log.items() if "trunc" in k or "success" in k or "stage" in k},
+                     "ee_z": [round(float(e[:, 2].min()), 3) for e in ee],
+                     "ee_speed_max": [round(float(e[:, 7:].norm(dim=-1).max()), 3) for e in ee],
+                     "velocity_limit": float(u.cfg.velocity_limit)}
+        print("FIRST_END " + json.dumps(first_end), flush=True)
+    ended |= done
     live = ~ended
     max_drift = torch.where(live, torch.maximum(max_drift, (rel_obj() - r0).norm(dim=-1)), max_drift)
     arm_contact |= (u.contacts[:, -1] > 0) & live
@@ -71,6 +83,7 @@ for r, name in ((False, "slot0_gives"), (True, "slot1_gives")):
                      "arm_contact_envs": int((arm_contact & m).sum())}
 ok = all(res[n]["ended_early"] == 0 and res[n]["max_object_drift_mm"] < 5.0 and res[n]["arm_contact_envs"] == 0
          for n in ("slot0_gives", "slot1_gives") if n in res) and max(res["palm_facing_deg_slot0"], res["palm_facing_deg_slot1"]) < 2.0
+res["first_end"] = first_end
 res["VERDICT"] = "PASS" if ok else "FAIL"
 print("VALIDATE_RESULT " + json.dumps(res), flush=True)
 env.close(); app.close()
