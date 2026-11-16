@@ -8,8 +8,20 @@ import torch, gymnasium as gym
 from omni.isaac.lab_tasks.utils import parse_env_cfg
 import omni.isaac.lab_tasks  # noqa
 cfg = parse_env_cfg(task_name=a.task, device=a.device, num_envs=2); cfg.use_reverse_curriculum = False
-env = gym.make(a.task, cfg=cfg); u = env.unwrapped; env.reset()
-env.step(torch.zeros((2, env.action_space.shape[-1]), device=u.device))
+env = gym.make(a.task, cfg=cfg); u = env.unwrapped
+names = list(u.cfg.contact_sensors_dict.keys())
+print("CONTACT_COLUMNS first 4:", names[:4], "... last:", names[-1], "| total", len(names), flush=True)
+def report(tag):
+    gs = {k: float(u.scene.sensors[f"{k.lower()}_w_ground"].data.force_matrix_w.abs().sum()) for k in u.cfg.keys}
+    hot = [names[i] for i in range(len(names)) if bool(u.contacts[:, i].any())]
+    print(f"STEP {tag}: contacts[:,0:2]={u.contacts[:, :2].tolist()} ground_force_sum={gs} "
+          f"episode_len={u.episode_length_buf.tolist()} nonzero_columns={hot[:6]}", flush=True)
+obs, _ = env.reset(); report("after_reset")
+z = torch.zeros((2, env.action_space.shape[-1]), device=u.device)
+for t in range(4):
+    _, _, term, tout, info = env.step(z)
+    print(f"   -> step {t}: terminated={term.tolist()} time_out={tout.tolist()} trunc_ground={info.get('log', {}).get('metrics/trunc_ground_contact')}", flush=True)
+    report(t)
 for k in u.cfg.keys:
     s = u.scene.sensors[f"{k.lower()}_w_ground"]
     f = s.data.force_matrix_w[0].abs().sum(dim=(-1, -2))           # per watched body, env 0
