@@ -24,6 +24,7 @@
 #   SEED           PPO/env seed                      (default: sb3_ppo_cfg.yaml's seed)
 #   EXPERIENCE     Kit app file; empty = headless profile (default). The full profile
 #                  (/isaac-sim/apps/omni.isaac.sim.python.kit) segfaults on newer drivers.
+#   WANDB_NAME     wandb run name                    (default: <job name>_<job id>)
 #   SMOKE_ITERS    e.g. 20 for a quick plumbing test; NEVER for a real run (see below)
 #
 # ---------------------------------------------------------------------------
@@ -104,6 +105,7 @@ trap cleanup EXIT
 WANDB_API_KEY="${WANDB_API_KEY:-}"
 [ -f "$HOME/.env.wandb" ] && source "$HOME/.env.wandb"
 WANDB_MODE=offline; [ -n "$WANDB_API_KEY" ] && WANDB_MODE=online
+[ -n "${SMOKE_ITERS:-}" ] && WANDB_MODE=offline  # keep test runs out of the wandb project
 
 EXTRA=""
 [ -n "${SEED:-}" ] && EXTRA="$EXTRA --seed $SEED"
@@ -120,7 +122,7 @@ stdbuf -oL -eL $RUNTIME exec --nv --containall \
   "$SIFRUN" \
   bash -c "export ISAACLAB_PATH=/workspace/isaaclab OMNI_KIT_ACCEPT_EULA=YES ACCEPT_EULA=Y PYTHONUNBUFFERED=1 && \
            export WANDB_MODE=$WANDB_MODE WANDB_DIR=/workspace/isaaclab/$TASK_REL/train/logs WANDB_API_KEY='${WANDB_API_KEY}' && \
-           export WANDB_NAME='${SLURM_JOB_NAME:-baseline}_$JOB' && \
+           export WANDB_NAME='${WANDB_NAME:-${SLURM_JOB_NAME:-baseline}_$JOB}' && \
            cd /workspace/isaaclab && /isaac-sim/python.sh $TRAINPY \
              --task $TASK --num_envs $ENVS --headless $EXTRA" || RC=$?
 echo "TRAIN_EXIT=$RC PERSISTED_TO=$OUT END=$(date)"

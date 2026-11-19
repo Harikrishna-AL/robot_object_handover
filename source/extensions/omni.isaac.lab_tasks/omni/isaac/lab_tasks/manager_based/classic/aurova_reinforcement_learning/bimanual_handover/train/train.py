@@ -105,7 +105,9 @@ from networks import *
 # directory for logging into
 path_to_train = "/workspace/isaaclab/source/extensions/omni.isaac.lab_tasks/omni/isaac/lab_tasks/manager_based/classic/aurova_reinforcement_learning/bimanual_handover/train"
 log_dir = os.path.join(path_to_train, "logs", "sb3", args_cli.task, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
-run = wandb.init(project="bim_hand_dani_julio", name=log_dir.split("/")[-1], sync_tensorboard=True)
+# run name / project from WANDB_NAME / WANDB_PROJECT when set (launcher scripts), else as before
+run = wandb.init(project=os.environ.get("WANDB_PROJECT", "bim_hand_dani_julio"),
+                 name=os.environ.get("WANDB_NAME") or log_dir.split("/")[-1], sync_tensorboard=True)
 
 
 @hydra_task_config(args_cli.task, "sb3_cfg_entry_point")
