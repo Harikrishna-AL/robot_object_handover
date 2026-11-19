@@ -8,8 +8,12 @@ From: nvcr.io/nvidia/isaac-sim:4.2.0
 # the repo present on disk (ISAACLAB_PATH below) so `isaaclab.sh --install` can
 # resolve and pip-install each extension's setup.py.
 #
-# Build on a Capella compute node (capella-interactive), not the login node:
-#   apptainer build --fakeroot isaac-lab-base.sif isaac-lab-base.def
+# Build from the REPO ROOT (the %files line below copies the current directory), on a
+# compute node rather than a login node, with ~60 GB free in the cache/tmp dirs:
+#   cd <repo root>
+#   apptainer build --fakeroot isaac-lab-base.sif docker/cluster/isaac-lab-base.def
+# Pulling nvcr.io/nvidia/isaac-sim needs an NGC account: export
+#   APPTAINER_DOCKER_USERNAME='$oauthtoken' APPTAINER_DOCKER_PASSWORD=<NGC API key>
 
 %arguments
     ISAACSIM_ROOT_PATH=/isaac-sim
@@ -25,8 +29,8 @@ From: nvcr.io/nvidia/isaac-sim:4.2.0
     export OMNI_KIT_ALLOW_ROOT=1
 
 %files
-    # synced repo checked out at build time on the cluster filesystem
-    /data/cat/ws/hapi039h-isaac/isaaclab /workspace/isaaclab
+    # this checkout (relative to the directory the build runs from: the repo root)
+    . /workspace/isaaclab
 
 %post
     export DEBIAN_FRONTEND=noninteractive

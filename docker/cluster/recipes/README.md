@@ -1,6 +1,9 @@
-# Working training recipe — Capella
+# Working training recipe for the baseline
 
-How to train `Isaac-Bimanual-Direct-reach-v0` so that it actually learns.
+How to train `Isaac-Bimanual-Direct-reach-v0` (the handover method of Frau-Alfaro et
+al., arXiv:2506.16822: UR5e gives, Kinova GEN3 receives) so that it actually learns. It
+was developed on TU Dresden's Capella cluster and runs on any SLURM cluster with an
+NVIDIA GPU and Apptainer or Singularity. See [Quick start](#quick-start-any-slurm-cluster).
 
 ## The one thing to know: don't pass `--max_iterations`
 
@@ -81,17 +84,62 @@ afterwards from a saved checkpoint.
 `MaxTime` on the `capella` partition is `UNLIMITED` (default 8h), so a single
 48-hour job can cover the full budget.
 
-## Usage
+## Quick start (any SLURM cluster)
+
+You need a SLURM cluster with one NVIDIA GPU per job (tested on an H100), Apptainer or
+Singularity, about 10 GB in `$HOME` for the image, and about 20 GB of node-local scratch.
+You don't need to install Isaac Sim. Untested: compute nodes without internet access (Isaac
+Sim may try to reach NVIDIA's asset server at start-up).
+
+**1. Get the code**
 
 ```bash
-# build the container once (see ../isaac-lab-base.def), then:
-export ISAACLAB_TREE=$HOME/isaaclab          # defaults to $HOME/isaaclab
-export SIF_PATH=$HOME/isaac-lab-base.sif     # defaults to $HOME/isaac-lab-base.sif
-sbatch docker/cluster/recipes/train_baseline.sh
+git clone -b baseline-working https://github.com/Harikrishna-AL/robot_object_handover.git
+cd robot_object_handover
 ```
 
-Checkpoints land in `$HOME/runs/<jobid>/` and are rescued every 15 minutes, so
-a job killed at its time limit loses at most that.
+**2. Get the container image** (Isaac Sim 4.2 + Isaac Lab + SB3, about 8 GB). Pick one:
+
+- *Copy a built one* (easiest): get `isaac-lab-base.sif` from someone who has it and put
+  it at `$HOME/isaac-lab-base.sif`.
+- *Build it*: this needs an NGC account (for `nvcr.io/nvidia/isaac-sim:4.2.0`) and
+  `--fakeroot` support. Run it on a compute node, from the repo root:
+
+  ```bash
+  export APPTAINER_DOCKER_USERNAME='$oauthtoken' APPTAINER_DOCKER_PASSWORD=<your NGC API key>
+  apptainer build --fakeroot $HOME/isaac-lab-base.sif docker/cluster/isaac-lab-base.def
+  ```
+
+**3. Smoke test** (about 10 minutes; checks that the GPU, the container and the task load):
+
+```bash
+SMOKE_ITERS=20 sbatch -p <partition> -A <account> --time=00:30:00 docker/cluster/recipes/train_baseline.sh
+```
+
+Look for `total_timesteps` rows in `baseline_<jobid>.log`, then `TRAIN_EXIT=0` at the end.
+
+**4. Real run** (6e8 steps, about 48 h on one H100). Leave `SMOKE_ITERS` unset:
+
+```bash
+sbatch -p <partition> -A <account> docker/cluster/recipes/train_baseline.sh
+# optional knobs: SEED=2 ENVS=1024 OUT_DIR=$HOME/runs SIF_PATH=... sbatch ...
+```
+
+If your partition caps jobs below 48 h, pass `--time` and expect a partial run. The script
+does not resume.
+
+Checkpoints and logs persist to `$HOME/runs/baseline_<jobid>/` every 15 minutes, so a job
+killed at its time limit loses at most that. wandb logs offline unless `WANDB_API_KEY` is
+set (in the environment or in `$HOME/.env.wandb`). Offline logs are in the output folder
+for `wandb sync`. Track progress with `grep -a 'ep_rew_mean\|total_timesteps'
+baseline_<jobid>.log` and compare against the reference curve above.
+
+If it fails:
+- `Segmentation fault` right after Kit starts: do not set `EXPERIENCE` to the full
+  `omni.isaac.sim.python.kit` profile. The default headless profile works on newer drivers.
+- Job hangs at start-up while binding paths: keep `$TMPDIR` and `$HOME` off slow or
+  parallel network filesystems, or point `TMPDIR` at local disk.
+- Some nodes fail with GPU or driver errors: add them to `--exclude=` on the sbatch line.
 
 ## Gotchas hit while getting this working
 
